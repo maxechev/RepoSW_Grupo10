@@ -350,6 +350,16 @@ def dashboard_alumno(request):
         'id_disciplina',
         'id_disciplina__id_instalacion',
     ).first()
+    
+    if alumno and alumno.estado == 'Inactivo':
+        # Cerrar sesión para que no pueda volver a entrar
+        if 'usuario_id' in request.session:
+            del request.session['usuario_id']
+        
+        return render(request, 'core/alumno-inactivo.html')
+
+    if not alumno:
+        return redirect('login')
 
     if request.method == 'POST' and request.POST.get('accion') == 'inscribir_deporte':
         request.session['panel_activo'] = 'deportes'
@@ -2899,10 +2909,8 @@ def lista_alumnos_admin(request):
     if not persona or dashboard_url != 'dashboard-administrativo':
         return redirect('login')
     
-    # Forzar que el panel activo sea 'alumnos'
     request.session['panel_activo'] = 'alumnos'
     
-    # Reutilizar la lógica del dashboard administrativo
     administrativo = PersonalAdministrativo.objects.filter(id_persona=persona).first()
     instalaciones = Instalacion.objects.all()
     reservas = Reserva.objects.select_related('id_instalacion', 'id_persona_solicitante').all()
@@ -2921,42 +2929,209 @@ def lista_alumnos_admin(request):
     documentacion_pendiente = DocumentacionAlumno.objects.filter(estado='Pendiente').count()
     documentaciones = DocumentacionAlumno.objects.filter(estado='Pendiente').order_by('-fecha_envio')
     
-    # Datos de alumnos
     alumnos = Alumno.objects.select_related('id_persona', 'id_curso').all().order_by('id_persona__apellido', 'id_persona__nombre')
+    cursos_disponibles = Curso.objects.all().order_by('nivel', 'anio', 'comision') # 👈 NUEVO: Para el formulario
     
-    # Si viene un legajo, mostrar detalle
     legajo_detalle = request.GET.get('legajo')
     alumno_detalle = None
     if legajo_detalle:
-        alumno_detalle = get_object_or_404(
-            Alumno.objects.select_related('id_persona', 'id_curso'), 
-            legajo=legajo_detalle
-        )
+        alumno_detalle = get_object_or_404(Alumno.objects.select_related('id_persona', 'id_curso'), legajo=legajo_detalle)
     
     return render(request, 'core/dashboard-administrativo.html', {
-        'persona': persona,
-        'administrativo': administrativo,
-        'instalaciones': instalaciones,
-        'reservas': reservas,
-        'opiniones': opiniones,
-        'cuotas': cuotas,
-        'cuotas_pendientes': cuotas_pendientes,
-        'solicitudes': solicitudes,
-        'inscripciones_pendientes': inscripciones_pendientes,
-        'pagos_pendientes': pagos_pendientes,
-        'documentaciones': documentaciones,
-        'documentacion_pendiente': documentacion_pendiente,
-        'panel_activo': 'alumnos',
-        'alumnos': alumnos,
-        'alumno_detalle': alumno_detalle,
+        'persona': persona, 'administrativo': administrativo, 'instalaciones': instalaciones,
+        'reservas': reservas, 'opiniones': opiniones, 'cuotas': cuotas,
+        'cuotas_pendientes': cuotas_pendientes, 'solicitudes': solicitudes,
+        'inscripciones_pendientes': inscripciones_pendientes, 'pagos_pendientes': pagos_pendientes,
+        'documentaciones': documentaciones, 'documentacion_pendiente': documentacion_pendiente,
+        'panel_activo': 'alumnos', 'alumnos': alumnos, 'alumno_detalle': alumno_detalle,
+        'cursos_disponibles': cursos_disponibles, # 👈 NUEVO
     })
-    
+
+@never_cache
+def alta_alumno_admin(request):
+    if request.method == 'POST':
+        # Datos del usuario
+        nombre_usuario = request.POST.get('nombre_usuario')
+        contrasenia = request.POST.get('contrasenia')
+
+        # Datos de la persona
+        dni = request.POST.get('dni')
+        nombre = request.POST.get('nombre')
+        apellido = request.POST.get('apellido')
+        fecha_nacimiento = request.POST.get('fecha_nacimiento')
+        direccion = request.POST.get('direccion')
+        telefono = request.POST.get('telefono')
+        email = request.POST.get('email')
+
+        # Datos del alumno
+        legajo = request.POST.get('legajo')
+        id_curso = request.POST.get('id_curso')
+
+        errores = []
+
+        # Validar usuario
+        if not nombre_usuario:
+            errores.append("El nombre de usuario es obligatorio.")
+
+        if not contrasenia:
+            errores.append("La contraseña provisoria es obligatoria.")
+
+        if nombre_usuario and Usuario.objects.filter(
+            nombre_usuario=nombre_usuario
+        ).exists():
+            errores.append("El nombre de usuario ya existe.")
+
+        # Validar legajo
+        if legajo and Alumno.objects.filter(legajo=legajo).exists():
+            errores.append("El legajo ya existe.")
+
+        # Validar DNI
+        if dni and Persona.objects.filter(dni=dni).exists():
+            errores.append("El DNI ya está registrado.")
+
+        # Validar fecha
+        try:
+            fecha_nac_obj = datetime.strptime(
+                fecha_nacimiento,
+                '%Y-%m-%d'
+            ).date()
+        except (ValueError, TypeError):
+            errores.append("Fecha de nacimiento inválida.")
+            fecha_nac_obj = None
+
+        # Validar curso
+        curso = None
+
+        if not id_curso:
+            errores.append("No se seleccionó un curso.")
+        else:
+            try:
+                curso = Curso.objects.get(id_curso=id_curso)
+            except Curso.DoesNotExist:
+                errores.append("El curso seleccionado no existe.")
+
+        # Si hubo errores, no crear nada
+        if errores:
+            for error in errores:
+                messages.error(request, error)
+
+            return redirect('lista-alumnos-admin')
+
+        try:
+            # 1. Crear Usuario
+            usuario = Usuario.objects.create(
+                nombre_usuario=nombre_usuario,
+                contrasenia=contrasenia,
+                correo=email if email else None
+            )
+
+            # 2. Crear Persona vinculada al Usuario
+            persona = Persona.objects.create(
+                id_usuario=usuario,
+                dni=dni,
+                nombre=nombre,
+                apellido=apellido,
+                fecha_nacimiento=fecha_nac_obj,
+                direccion=direccion,
+                telefono=telefono,
+                email=email
+            )
+
+            # 3. Crear Alumno vinculado a Persona y Curso
+            Alumno.objects.create(
+                legajo=legajo,
+                id_persona=persona,
+                id_curso=curso,
+                fecha_ingreso=date.today()
+            )
+
+            messages.success(
+                request,
+                "Alumno y cuenta de usuario registrados exitosamente."
+            )
+
+        except Exception as e:
+            messages.error(
+                request,
+                f"Error al crear el alumno: {str(e)}"
+            )
+
+        return redirect('lista-alumnos-admin')
+
+    return redirect('lista-alumnos-admin')
+
+@never_cache
+def modificar_alumno_admin(request, legajo):
+    alumno = get_object_or_404(Alumno, legajo=legajo)
+    persona = alumno.id_persona
+
+    if request.method == 'POST':
+        nuevo_dni = request.POST.get('dni')
+        nombre = request.POST.get('nombre')
+        apellido = request.POST.get('apellido')
+        fecha_nacimiento = request.POST.get('fecha_nacimiento')
+        direccion = request.POST.get('direccion')
+        telefono = request.POST.get('telefono')
+        email = request.POST.get('email')
+        id_curso = request.POST.get('id_curso')
+        estado = request.POST.get('estado', 'Activo')
+
+        errores = []
+        if Persona.objects.filter(dni=nuevo_dni).exclude(id=persona.id).exists():
+            errores.append("El DNI ya está registrado en otra persona.")
+        
+        try:
+            fecha_nac_obj = datetime.strptime(fecha_nacimiento, '%Y-%m-%d').date()
+        except ValueError:
+            errores.append("Fecha de nacimiento inválida.")
+
+        if errores:
+            for err in errores:
+                messages.error(request, err)
+            return redirect('lista-alumnos-admin')
+
+        persona.dni = nuevo_dni
+        persona.nombre = nombre
+        persona.apellido = apellido
+        persona.fecha_nacimiento = fecha_nac_obj
+        persona.direccion = direccion
+        persona.telefono = telefono
+        persona.email = email
+        persona.save()
+
+        alumno.id_curso_id = id_curso
+        alumno.estado = estado 
+        alumno.save()
+
+        messages.success(request, "Datos del alumno actualizados correctamente.")
+        return redirect('lista-alumnos-admin')
+
+@never_cache
+def baja_alumno_admin(request, legajo):
+    if request.method == 'POST':
+        alumno = get_object_or_404(Alumno, legajo=legajo)
+
+        persona = alumno.id_persona
+        usuario = persona.id_usuario
+
+        # Primero eliminamos el alumno
+        alumno.delete()
+
+        # Después eliminamos la persona
+        persona.delete()
+
+        # Finalmente eliminamos el usuario
+        if usuario:
+            usuario.delete()
+
+        messages.success(
+            request,
+            "Alumno, persona y usuario dados de baja correctamente."
+        )
+
+    return redirect('lista-alumnos-admin')
+
 @never_cache
 def detalle_alumno_admin(request, legajo):
-    """Vista para mostrar el detalle de un alumno dentro del dashboard."""
-    persona, dashboard_url = obtener_datos_sesion(request)
-    if not persona or dashboard_url != 'dashboard-administrativo':
-        return redirect('login')
-    
-    # Redirigir a la lista con el parámetro legajo
+    """Redirige a la lista de alumnos pasando el legajo por GET para mostrar el detalle."""
     return redirect(f"{reverse('lista-alumnos-admin')}?legajo={legajo}")
