@@ -700,7 +700,20 @@
       padding: 14px 18px; border-bottom: 1px solid #e2e8f0;
     }
     .tabla td { padding: 14px 18px; font-size: 14px; color: #334155; border-bottom: 1px solid #f1f5f9; }
-    .tabla tr:last-child td { border-bottom: none; }
+.tabla tr:last-child td { border-bottom: none; }
+
+/* Las filas de edición inline deben ocupar todo el ancho de la tabla. */
+.tabla tr.fila-edicion-abm > td {
+  width: 100% !important;
+  max-width: none !important;
+  padding: 0 !important;
+}
+.tabla tr.fila-edicion-abm form,
+.tabla tr.fila-edicion-abm .form-grid {
+  width: 100% !important;
+  max-width: none !important;
+  box-sizing: border-box;
+}
     .badge { display: inline-block; padding: 3px 10px; border-radius: 999px; font-size: 12px; font-weight: 600; }
     .badge-green { background: #dcfce7; color: #166534; }
     .badge-yellow { background: #fef9c3; color: #854d0e; }
@@ -1331,4 +1344,44 @@
   display:flex;
   flex-direction:column;
   gap:8px;
+}
+/* Forzar que las filas de edición ocupen TODO el ancho de la tabla */
+.tabla tr.fila-edicion-abm {
+    display: table-row !important;
+}
+
+.tabla tr.fila-edicion-abm > td {
+    padding: 0 !important;
+    width: 100% !important;
+    max-width: 100% !important;
+    display: table-cell !important;
+}
+
+.tabla tr.fila-edicion-abm form {
+    width: 100% !important;
+    max-width: none !important;
+    padding: 24px 32px !important;
+    box-sizing: border-box;
+    margin: 0 !important;
+}
+
+.tabla tr.fila-edicion-abm .form-grid {
+    width: 100% !important;
+    max-width: none !important;
+    grid-template-columns: repeat(2, 1fr) !important;
+    gap: 20px !important;
+    display: grid !important;
+}
+
+.tabla tr.fila-edicion-abm .form-group {
+    width: 100% !important;
+    min-width: 0 !important;
+}
+
+.tabla tr.fila-edicion-abm .form-group input,
+.tabla tr.fila-edicion-abm .form-group select,
+.tabla tr.fila-edicion-abm .form-group textarea {
+    width: 100% !important;
+    max-width: none !important;
+    box-sizing: border-box;
 }

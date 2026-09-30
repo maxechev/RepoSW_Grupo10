@@ -13,6 +13,7 @@ import resend
 import os
 from django.shortcuts import render, redirect
 from django.db.models import Avg
+from django.db import transaction
 import json
 from django.core.mail import EmailMessage
 from django.contrib import messages
@@ -50,6 +51,7 @@ from .models import (
     Arancel,
     DocumentacionAlumno,
     Tarea,
+    DocenteDisciplina,
 )
 COMUNICADOS_FILE = os.path.join(
     os.path.dirname(__file__),
@@ -803,13 +805,22 @@ def dashboard_docente(request):
     
     docente = Docente.objects.filter(id_persona=persona).first()
 
-    materias = Materia.objects.filter(
-        docentedictamateria__id_docente=docente
-    ).distinct()
-
-    cursos = Curso.objects.filter(
-        cursocursamaterias__id_materia__in=materias
-    ).distinct()
+    asignaciones = DocenteDictaMateria.objects.filter(id_docente=docente)
+    asignaciones_directas = asignaciones.exclude(id_curso__isnull=True)
+    if asignaciones_directas.exists():
+        materias = Materia.objects.filter(
+            id_materia__in=asignaciones_directas.values('id_materia_id')
+        ).distinct()
+        cursos = Curso.objects.filter(
+            id_curso__in=asignaciones_directas.values('id_curso_id')
+        ).distinct()
+    else:
+        materias = Materia.objects.filter(
+            docentedictamateria__id_docente=docente
+        ).distinct()
+        cursos = Curso.objects.filter(
+            cursocursamaterias__id_materia__in=materias
+        ).distinct()
 
     alumnos = Alumno.objects.filter(
         id_curso__in=cursos
@@ -860,7 +871,8 @@ def dashboard_docente(request):
 
     # horarios
     horarios = CursoCursaMaterias.objects.filter(
-        id_materia__in=materias
+        id_materia__in=materias,
+        id_curso__in=cursos,
     ).select_related('id_curso', 'id_materia')
 
     horario_dict = {}
@@ -908,13 +920,23 @@ def horario_docente(request):
     if not docente:
         return redirect('login')
 
-    materias = Materia.objects.filter(
-        docentedictamateria__id_docente=docente
-    ).distinct()
-
-    cursos = CursoCursaMaterias.objects.filter(
-        id_materia__in=materias
-    )
+    asignaciones = DocenteDictaMateria.objects.filter(id_docente=docente)
+    asignaciones_directas = asignaciones.exclude(id_curso__isnull=True)
+    if asignaciones_directas.exists():
+        materias = Materia.objects.filter(
+            id_materia__in=asignaciones_directas.values('id_materia_id')
+        ).distinct()
+        cursos = CursoCursaMaterias.objects.filter(
+            id_curso__in=asignaciones_directas.values('id_curso_id'),
+            id_materia__in=asignaciones_directas.values('id_materia_id'),
+        )
+    else:
+        materias = Materia.objects.filter(
+            docentedictamateria__id_docente=docente
+        ).distinct()
+        cursos = CursoCursaMaterias.objects.filter(
+            id_materia__in=materias
+        )
 
     horario = {}
 
@@ -990,13 +1012,16 @@ def dashboard_directivo(request):
         # Agregar materia
         docentes_dict[docente_key]['materias'].append(materia.nombre)
         
-        # Buscar cursos donde se dicta esta materia
-        cursos_materia = CursoCursaMaterias.objects.filter(
-            id_materia=materia
-        ).select_related('id_curso')
-        
-        for curso_materia in cursos_materia:
-            curso = curso_materia.id_curso
+        # Las asignaciones nuevas indican el curso exacto; las antiguas
+        # sin curso mantienen el comportamiento anterior por materia.
+        if relacion.id_curso_id:
+            cursos = [relacion.id_curso]
+        else:
+            cursos = [cm.id_curso for cm in CursoCursaMaterias.objects.filter(
+                id_materia=materia
+            ).select_related('id_curso')]
+
+        for curso in cursos:
             curso_texto = f"{curso.anio}° {curso.comision} ({curso.nivel})"
             docentes_dict[docente_key]['cursos'].add(curso_texto)
     
@@ -1339,6 +1364,36 @@ def lista_profesores_admin(request):
     
     # DATOS DE PROFESORES
     profesores = Docente.objects.select_related('id_persona').all().order_by('id_persona__apellido', 'id_persona__nombre')
+    curso_materia_options = CursoCursaMaterias.objects.select_related(
+        'id_curso', 'id_materia'
+    ).order_by('id_curso__nivel', 'id_curso__anio', 'id_curso__comision', 'id_materia__nombre')
+    for opcion in curso_materia_options:
+        opcion.clave = f'{opcion.id_curso_id}:{opcion.id_materia_id}'
+    materia_curso_options = []
+    for materia in Materia.objects.all().order_by('nombre'):
+        materia.cursos_disponibles = Curso.objects.filter(
+            cursocursamaterias__id_materia=materia
+        ).distinct().order_by('nivel', 'anio', 'comision')
+        for curso in materia.cursos_disponibles:
+            curso.asignacion_clave = f'{curso.id_curso}:{materia.id_materia}'
+        if materia.cursos_disponibles.exists():
+            materia_curso_options.append(materia)
+    for profesor in profesores:
+        relaciones = DocenteDictaMateria.objects.filter(
+            id_docente=profesor
+        ).select_related('id_materia')
+        profesor.materia_ids = [relacion.id_materia_id for relacion in relaciones]
+        relaciones_directas = [relacion for relacion in relaciones if relacion.id_curso_id]
+        if relaciones_directas:
+            profesor.asignacion_keys = [
+                f'{relacion.id_curso_id}:{relacion.id_materia_id}'
+                for relacion in relaciones_directas
+            ]
+        else:
+            profesor.asignacion_keys = [
+                opcion.clave for opcion in curso_materia_options
+                if opcion.id_materia_id in profesor.materia_ids
+            ]
     
     # Si viene un legajo por GET, mostrar detalle
     legajo_detalle = request.GET.get('legajo')
@@ -1347,6 +1402,12 @@ def lista_profesores_admin(request):
         profesor_detalle = get_object_or_404(
             Docente.objects.select_related('id_persona'), 
             legajo=legajo_detalle
+        )
+        profesor_detalle.asignaciones = DocenteDictaMateria.objects.filter(
+            id_docente=profesor_detalle,
+            id_curso__isnull=False,
+        ).select_related('id_curso', 'id_materia').order_by(
+            'id_curso__nivel', 'id_curso__anio', 'id_curso__comision', 'id_materia__nombre'
         )
     
     return render(request, 'core/dashboard-administrativo.html', {
@@ -1363,6 +1424,8 @@ def lista_profesores_admin(request):
         'documentacion_pendiente': documentacion_pendiente,
         'panel_activo': 'profesores',
         'profesores': profesores,
+        'curso_materia_options': curso_materia_options,
+        'materia_curso_options': materia_curso_options,
         'profesor_detalle': profesor_detalle,
     })
 
@@ -1370,6 +1433,196 @@ def lista_profesores_admin(request):
 def detalle_profesor_admin(request, legajo):
     """Redirige a la lista de profesores pasando el legajo por GET para mostrar el detalle."""
     return redirect(f"{reverse('lista-profesores-admin')}?legajo={legajo}")
+
+
+def _asignaciones_profesor(post):
+    """Devuelve pares (curso, materia) que existen en el plan del curso."""
+    pares = []
+    for valor in post.getlist('asignaciones'):
+        try:
+            curso_id, materia_id = valor.split(':', 1)
+            curso_id = int(curso_id)
+            materia_id = int(materia_id)
+        except (TypeError, ValueError):
+            continue
+        if CursoCursaMaterias.objects.filter(
+            id_curso_id=curso_id,
+            id_materia_id=materia_id,
+        ).exists():
+            pares.append((curso_id, materia_id))
+    return list(dict.fromkeys(pares))
+
+
+@never_cache
+def alta_profesor_admin(request):
+    """Registra la cuenta, los datos personales y el legajo de un docente."""
+    persona_sesion, dashboard_url = obtener_datos_sesion(request)
+    if not persona_sesion or dashboard_url != 'dashboard-administrativo':
+        return redirect('login')
+
+    if request.method == 'POST':
+        nombre_usuario = (request.POST.get('nombre_usuario') or '').strip()
+        contrasenia = request.POST.get('contrasenia') or ''
+        dni = (request.POST.get('dni') or '').strip()
+        nombre = (request.POST.get('nombre') or '').strip()
+        apellido = (request.POST.get('apellido') or '').strip()
+        fecha_nacimiento = request.POST.get('fecha_nacimiento') or ''
+        direccion = (request.POST.get('direccion') or '').strip()
+        telefono = (request.POST.get('telefono') or '').strip()
+        email = (request.POST.get('email') or '').strip() or None
+        titulo = (request.POST.get('titulo') or '').strip()
+        especialidad = (request.POST.get('especialidad') or '').strip() or None
+        fecha_ingreso = request.POST.get('fecha_ingreso') or ''
+        asignaciones = _asignaciones_profesor(request.POST)
+        errores = []
+
+        if not nombre_usuario or not contrasenia:
+            errores.append('El usuario y la contraseña provisoria son obligatorios.')
+        if not dni or not nombre or not apellido:
+            errores.append('DNI, nombre y apellido son obligatorios.')
+        if Usuario.objects.filter(nombre_usuario=nombre_usuario).exists():
+            errores.append('El nombre de usuario ya existe.')
+        if dni and Persona.objects.filter(dni=dni).exists():
+            errores.append('El DNI ya está registrado.')
+        if email and Usuario.objects.filter(correo=email).exists():
+            errores.append('El correo ya está asociado a otra cuenta.')
+        if not titulo:
+            errores.append('El título docente es obligatorio.')
+
+        try:
+            fecha_nac_obj = datetime.strptime(fecha_nacimiento, '%Y-%m-%d').date()
+        except (ValueError, TypeError):
+            fecha_nac_obj = None
+            errores.append('La fecha de nacimiento no es válida.')
+        try:
+            fecha_ingreso_obj = datetime.strptime(fecha_ingreso, '%Y-%m-%d').date() if fecha_ingreso else date.today()
+        except (ValueError, TypeError):
+            fecha_ingreso_obj = None
+            errores.append('La fecha de ingreso no es válida.')
+
+        if errores:
+            for error in errores:
+                messages.error(request, error)
+            return redirect('lista-profesores-admin')
+
+        with transaction.atomic():
+            usuario = Usuario.objects.create(
+                nombre_usuario=nombre_usuario,
+                contrasenia=contrasenia,
+                correo=email,
+            )
+            persona = Persona.objects.create(
+                id_usuario=usuario,
+                dni=dni,
+                nombre=nombre,
+                apellido=apellido,
+                fecha_nacimiento=fecha_nac_obj,
+                direccion=direccion or None,
+                telefono=telefono or None,
+                email=email,
+            )
+            docente = Docente.objects.create(
+                id_persona=persona,
+                titulo=titulo,
+                especialidad=especialidad,
+                fecha_ingreso=fecha_ingreso_obj,
+            )
+            DocenteDictaMateria.objects.bulk_create([
+                DocenteDictaMateria(
+                    id_docente=docente,
+                    id_curso_id=curso_id,
+                    id_materia_id=materia_id,
+                )
+                for curso_id, materia_id in asignaciones
+            ])
+        messages.success(request, 'Profesor registrado correctamente.')
+
+    return redirect('lista-profesores-admin')
+
+
+@never_cache
+def modificar_profesor_admin(request, legajo):
+    persona_sesion, dashboard_url = obtener_datos_sesion(request)
+    if not persona_sesion or dashboard_url != 'dashboard-administrativo':
+        return redirect('login')
+
+    profesor = get_object_or_404(Docente.objects.select_related('id_persona', 'id_persona__id_usuario'), legajo=legajo)
+    persona = profesor.id_persona
+    if request.method == 'POST':
+        dni = (request.POST.get('dni') or '').strip()
+        email = (request.POST.get('email') or '').strip() or None
+        try:
+            fecha_nac_obj = datetime.strptime(request.POST.get('fecha_nacimiento') or '', '%Y-%m-%d').date()
+            fecha_ingreso_obj = datetime.strptime(request.POST.get('fecha_ingreso') or '', '%Y-%m-%d').date()
+        except (ValueError, TypeError):
+            messages.error(request, 'Las fechas ingresadas no son válidas.')
+            return redirect('lista-profesores-admin')
+
+        errores = []
+        if not dni or not (request.POST.get('nombre') or '').strip() or not (request.POST.get('apellido') or '').strip():
+            errores.append('DNI, nombre y apellido son obligatorios.')
+        if Persona.objects.filter(dni=dni).exclude(id=persona.id).exists():
+            errores.append('El DNI ya está registrado en otra persona.')
+        if email and Usuario.objects.filter(correo=email).exclude(id=persona.id_usuario_id).exists():
+            errores.append('El correo ya está asociado a otra cuenta.')
+        if not (request.POST.get('titulo') or '').strip():
+            errores.append('El título docente es obligatorio.')
+        if errores:
+            for error in errores:
+                messages.error(request, error)
+            return redirect('lista-profesores-admin')
+
+        with transaction.atomic():
+            persona.dni = dni
+            persona.nombre = (request.POST.get('nombre') or '').strip()
+            persona.apellido = (request.POST.get('apellido') or '').strip()
+            persona.fecha_nacimiento = fecha_nac_obj
+            persona.direccion = (request.POST.get('direccion') or '').strip() or None
+            persona.telefono = (request.POST.get('telefono') or '').strip() or None
+            persona.email = email
+            persona.save()
+            if persona.id_usuario:
+                persona.id_usuario.correo = email
+                persona.id_usuario.save(update_fields=['correo'])
+            profesor.titulo = (request.POST.get('titulo') or '').strip()
+            profesor.especialidad = (request.POST.get('especialidad') or '').strip() or None
+            profesor.fecha_ingreso = fecha_ingreso_obj
+            profesor.save()
+            DocenteDictaMateria.objects.filter(id_docente=profesor).delete()
+            asignaciones = _asignaciones_profesor(request.POST)
+            DocenteDictaMateria.objects.bulk_create([
+                DocenteDictaMateria(
+                    id_docente=profesor,
+                    id_curso_id=curso_id,
+                    id_materia_id=materia_id,
+                )
+                for curso_id, materia_id in asignaciones
+            ])
+        messages.success(request, 'Datos del profesor actualizados correctamente.')
+
+    return redirect('lista-profesores-admin')
+
+
+@never_cache
+def baja_profesor_admin(request, legajo):
+    persona_sesion, dashboard_url = obtener_datos_sesion(request)
+    if not persona_sesion or dashboard_url != 'dashboard-administrativo':
+        return redirect('login')
+
+    if request.method == 'POST':
+        profesor = get_object_or_404(Docente.objects.select_related('id_persona'), legajo=legajo)
+        persona = profesor.id_persona
+        usuario = persona.id_usuario
+        with transaction.atomic():
+            DocenteDictaMateria.objects.filter(id_docente=profesor).delete()
+            DocenteDisciplina.objects.filter(legajo_docente=profesor).delete()
+            profesor.delete()
+            persona.delete()
+            if usuario:
+                usuario.delete()
+        messages.success(request, 'Profesor dado de baja correctamente.')
+
+    return redirect('lista-profesores-admin')
 
 @never_cache
 def aprobar_inscripcion(request, id_solicitud):
@@ -2650,10 +2903,18 @@ def crear_tarea(request):
         elif estado == 'Publicado':
             fecha_pub = timezone.now()
             
-        materia = Materia.objects.filter(
-            docentedictamateria__id_docente=docente,
-            cursocursamaterias__id_curso=curso
-        ).first()
+        asignacion_directa = DocenteDictaMateria.objects.filter(
+            id_docente=docente,
+            id_curso=curso,
+        ).select_related('id_materia').first()
+        if asignacion_directa:
+            materia = asignacion_directa.id_materia
+        else:
+            materia = Materia.objects.filter(
+                docentedictamateria__id_docente=docente,
+                docentedictamateria__id_curso__isnull=True,
+                cursocursamaterias__id_curso=curso,
+            ).first()
         
         Tarea.objects.create(
             docente=docente,
@@ -2816,10 +3077,21 @@ def guardar_nota(request):
             })
 
         # Verificar que esa materia la dicte este docente
-        materia = Materia.objects.filter(
-            id_materia=materia_id,
-            docentedictamateria__id_docente=docente
-        ).first()
+        asignaciones_directas = DocenteDictaMateria.objects.filter(
+            id_docente=docente,
+            id_curso__isnull=False,
+        )
+        if asignaciones_directas.exists():
+            materia = Materia.objects.filter(
+                id_materia=materia_id,
+                docentedictamateria__id_docente=docente,
+                docentedictamateria__id_curso=curso,
+            ).first()
+        else:
+            materia = Materia.objects.filter(
+                id_materia=materia_id,
+                docentedictamateria__id_docente=docente,
+            ).first()
 
         if not materia:
             return JsonResponse({
@@ -2950,11 +3222,9 @@ def lista_alumnos_admin(request):
 @never_cache
 def alta_alumno_admin(request):
     if request.method == 'POST':
-        # Datos del usuario
         nombre_usuario = request.POST.get('nombre_usuario')
         contrasenia = request.POST.get('contrasenia')
 
-        # Datos de la persona
         dni = request.POST.get('dni')
         nombre = request.POST.get('nombre')
         apellido = request.POST.get('apellido')
@@ -2963,13 +3233,11 @@ def alta_alumno_admin(request):
         telefono = request.POST.get('telefono')
         email = request.POST.get('email')
 
-        # Datos del alumno
         legajo = request.POST.get('legajo')
         id_curso = request.POST.get('id_curso')
 
         errores = []
 
-        # Validar usuario
         if not nombre_usuario:
             errores.append("El nombre de usuario es obligatorio.")
 
@@ -2981,27 +3249,21 @@ def alta_alumno_admin(request):
         ).exists():
             errores.append("El nombre de usuario ya existe.")
 
-        # Validar legajo
         if legajo and Alumno.objects.filter(legajo=legajo).exists():
             errores.append("El legajo ya existe.")
 
-        # Validar DNI
         if dni and Persona.objects.filter(dni=dni).exists():
             errores.append("El DNI ya está registrado.")
 
-        # Validar fecha
+        fecha_nac_obj = None
         try:
             fecha_nac_obj = datetime.strptime(
-                fecha_nacimiento,
-                '%Y-%m-%d'
+                fecha_nacimiento, '%Y-%m-%d'
             ).date()
         except (ValueError, TypeError):
             errores.append("Fecha de nacimiento inválida.")
-            fecha_nac_obj = None
 
-        # Validar curso
         curso = None
-
         if not id_curso:
             errores.append("No se seleccionó un curso.")
         else:
@@ -3010,22 +3272,41 @@ def alta_alumno_admin(request):
             except Curso.DoesNotExist:
                 errores.append("El curso seleccionado no existe.")
 
-        # Si hubo errores, no crear nada
+        if fecha_nac_obj and curso:
+            hoy = date.today()
+            edad = hoy.year - fecha_nac_obj.year
+            if (hoy.month, hoy.day) < (fecha_nac_obj.month, fecha_nac_obj.day):
+                edad -= 1
+
+            nivel = curso.nivel.lower()
+            edad_min, edad_max = None, None
+
+            if 'inicial' in nivel:
+                edad_min, edad_max = 3, 5
+            elif 'primaria' in nivel or 'primario' in nivel:
+                edad_min, edad_max = 6, 12
+            elif 'secundaria' in nivel or 'secundario' in nivel:
+                edad_min, edad_max = 13, 18
+
+            if edad_min and edad_max:
+                if edad < edad_min or edad > edad_max:
+                    errores.append(
+                        f"La edad del alumno ({edad} años) no corresponde al nivel "
+                        f"{curso.nivel} (edades esperadas: {edad_min} a {edad_max} años)."
+                    )
+                    
         if errores:
             for error in errores:
                 messages.error(request, error)
-
             return redirect('lista-alumnos-admin')
 
         try:
-            # 1. Crear Usuario
             usuario = Usuario.objects.create(
                 nombre_usuario=nombre_usuario,
                 contrasenia=contrasenia,
                 correo=email if email else None
             )
 
-            # 2. Crear Persona vinculada al Usuario
             persona = Persona.objects.create(
                 id_usuario=usuario,
                 dni=dni,
@@ -3037,7 +3318,6 @@ def alta_alumno_admin(request):
                 email=email
             )
 
-            # 3. Crear Alumno vinculado a Persona y Curso
             Alumno.objects.create(
                 legajo=legajo,
                 id_persona=persona,
@@ -3077,17 +3357,51 @@ def modificar_alumno_admin(request, legajo):
         estado = request.POST.get('estado', 'Activo')
 
         errores = []
-        if Persona.objects.filter(dni=nuevo_dni).exclude(id=persona.id).exists():
+
+        if nuevo_dni and Persona.objects.filter(dni=nuevo_dni).exclude(id=persona.id).exists():
             errores.append("El DNI ya está registrado en otra persona.")
-        
+
+        fecha_nac_obj = None
         try:
             fecha_nac_obj = datetime.strptime(fecha_nacimiento, '%Y-%m-%d').date()
-        except ValueError:
+        except (ValueError, TypeError):
             errores.append("Fecha de nacimiento inválida.")
 
+        curso = None
+        if not id_curso:
+            errores.append("No se seleccionó un curso.")
+        else:
+            try:
+                curso = Curso.objects.get(id_curso=id_curso)
+            except Curso.DoesNotExist:
+                errores.append("El curso seleccionado no existe.")
+
+        if fecha_nac_obj and curso:
+            hoy = date.today()
+            edad = hoy.year - fecha_nac_obj.year
+            if (hoy.month, hoy.day) < (fecha_nac_obj.month, fecha_nac_obj.day):
+                edad -= 1
+
+            nivel = curso.nivel.lower()
+            edad_min, edad_max = None, None
+
+            if 'inicial' in nivel:
+                edad_min, edad_max = 3, 5
+            elif 'primaria' in nivel or 'primario' in nivel:
+                edad_min, edad_max = 6, 12
+            elif 'secundaria' in nivel or 'secundario' in nivel:
+                edad_min, edad_max = 13, 18
+
+            if edad_min and edad_max:
+                if edad < edad_min or edad > edad_max:
+                    errores.append(
+                        f"La edad del alumno ({edad} años) no corresponde al nivel "
+                        f"{curso.nivel} (edades esperadas: {edad_min} a {edad_max} años)."
+                    )
+
         if errores:
-            for err in errores:
-                messages.error(request, err)
+            for error in errores:
+                messages.error(request, error)
             return redirect('lista-alumnos-admin')
 
         persona.dni = nuevo_dni
@@ -3100,11 +3414,13 @@ def modificar_alumno_admin(request, legajo):
         persona.save()
 
         alumno.id_curso_id = id_curso
-        alumno.estado = estado 
+        alumno.estado = estado
         alumno.save()
 
         messages.success(request, "Datos del alumno actualizados correctamente.")
         return redirect('lista-alumnos-admin')
+
+    return redirect('lista-alumnos-admin')
 
 @never_cache
 def baja_alumno_admin(request, legajo):
