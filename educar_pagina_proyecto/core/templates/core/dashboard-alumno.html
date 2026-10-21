@@ -100,6 +100,9 @@
           <a href="#" onclick="showPanel('deportes', this); return false;">
             <span class="nav-icon">⚽</span> Deportes
           </a>
+          <a href="#" onclick="showPanel('servicios', this); return false;">
+            <span class="nav-icon">🚌</span> Servicios
+          </a>
           <a href="#" onclick="showPanel('asistencia', this); return false;">
             <span class="nav-icon">✅</span> Asistencia
           </a>
@@ -337,6 +340,21 @@
           {% else %}
             <p style="color: #94a3b8;">No hay horarios registrados.</p>
           {% endif %}
+        </div>
+
+        <!-- SERVICIOS -->
+        <div id="panel-servicios" class="panel">
+          <p class="section-title">Transporte y comedor</p>
+          {% if messages and panel_activo == 'servicios' %}{% for message in messages %}<div class="{% if message.tags == 'success' or message.tags == 'info' %}mensaje-exito{% else %}mensaje-error{% endif %}" style="margin-bottom:12px;">{{ message }}</div>{% endfor %}{% endif %}
+          <div class="stat-card" style="margin-bottom:18px;">
+            <div class="stat-label">Transporte</div>
+            {% if inscripcion_transporte_alumno %}<div class="stat-sub">Inscripto en: <strong>{{ inscripcion_transporte_alumno.id_recorrido.nombre }}</strong> · {{ inscripcion_transporte_alumno.id_recorrido.turno }}</div><form method="post" action="{% url 'baja-inscripcion-transporte' %}" style="margin-top:10px;">{% csrf_token %}<button type="submit" class="btn-small" style="background:#dc2626;margin:0;" onclick="return confirm('¿Querés darte de baja del transporte?');">Darme de baja</button></form>
+            {% else %}<div class="stat-sub">Elegí un recorrido para enviar una solicitud.</div>{% for recorrido in recorridos_transporte %}<div style="display:flex;justify-content:space-between;align-items:center;border-top:1px solid #e2e8f0;padding:10px 0;"><span><strong>{{ recorrido.nombre }}</strong> · {{ recorrido.turno }}{% if recorrido.hora_salida %} · sale {{ recorrido.hora_salida|time:'H:i' }}{% endif %}<br><small>{{ recorrido.cupos_disponibles }} cupos disponibles</small></span>{% if recorrido.solicitud_pendiente %}<span><span class="badge" style="background:#fef3c7;color:#92400e;">Solicitud pendiente</span><form method="post" action="{% url 'cancelar-solicitud-servicio' recorrido.solicitud_pendiente.id_solicitud %}" style="display:inline;margin-left:6px;">{% csrf_token %}<button class="btn-small" style="background:#64748b;margin:0;">Cancelar</button></form></span>{% elif recorrido.cupos_disponibles > 0 %}<form method="post">{% csrf_token %}<input type="hidden" name="accion" value="solicitar_transporte"><input type="hidden" name="id_recorrido" value="{{ recorrido.id_recorrido }}"><button class="btn-small" style="background:#1d66c2;margin:0;">Solicitar</button></form>{% else %}<span class="badge" style="background:#fee2e2;color:#991b1b;">Completo</span>{% endif %}</div>{% empty %}<p>No hay recorridos disponibles.</p>{% endfor %}{% endif %}
+          </div>
+          <div class="stat-card"><div class="stat-label">Comedor escolar</div>{% if inscripcion_comedor_alumno %}<div class="stat-sub">Estás inscripto al comedor.</div><form method="post" action="{% url 'baja-inscripcion-comedor' %}" style="margin-top:10px;">{% csrf_token %}<button type="submit" class="btn-small" style="background:#dc2626;margin:0;" onclick="return confirm('¿Querés darte de baja del comedor?');">Darme de baja</button></form>{% elif solicitud_comedor_alumno %}<div class="stat-sub"><span class="badge" style="background:#fef3c7;color:#92400e;">Solicitud pendiente</span></div><form method="post" action="{% url 'cancelar-solicitud-servicio' solicitud_comedor_alumno.id_solicitud %}" style="margin-top:10px;">{% csrf_token %}<button type="submit" class="btn-small" style="background:#64748b;margin:0;">Cancelar solicitud</button></form>{% elif servicio_comedor.estado != 'Activo' %}<div class="stat-sub" style="color:#991b1b;">El servicio está temporalmente inactivo.</div>{% else %}<div class="stat-sub">{{ comedor_cupos_disponibles }} cupos disponibles.</div>{% if comedor_cupos_disponibles > 0 %}<form method="post">{% csrf_token %}<input type="hidden" name="accion" value="solicitar_comedor"><button type="submit" class="btn-small" style="background:#1d66c2;margin-top:10px;">Solicitar inscripción</button></form>{% else %}<span class="badge" style="background:#fee2e2;color:#991b1b;">Cupo completo</span>{% endif %}{% endif %}</div>
+          {% if solicitudes_servicio_alumno %}<div class="stat-card" style="margin-top:18px;"><div class="stat-label">Solicitudes pendientes</div>{% for solicitud in solicitudes_servicio_alumno %}<div class="stat-sub">{% if solicitud.tipo == 'transporte' %}Transporte: {{ solicitud.id_recorrido.nombre }}{% else %}Comedor{% endif %} · Pendiente de aprobación</div>{% endfor %}</div>{% endif %}
+          {% if solicitudes_rechazadas_servicio %}<div class="stat-card" style="margin-top:18px;border-left:4px solid #dc2626;"><div class="stat-label" style="color:#991b1b;">Solicitudes rechazadas</div>{% for solicitud in solicitudes_rechazadas_servicio %}<div class="stat-sub" style="color:#991b1b;">{% if solicitud.tipo == 'transporte' %}Transporte: {{ solicitud.id_recorrido.nombre }}{% else %}Comedor{% endif %} · {{ solicitud.observaciones|default:'La solicitud fue rechazada por el administrativo.' }}</div>{% endfor %}</div>{% endif %}
+          {% if solicitudes_aprobadas_servicio %}<div class="stat-card" style="margin-top:18px;border-left:4px solid #16a34a;"><div class="stat-label" style="color:#166534;">Solicitudes aprobadas</div>{% for solicitud in solicitudes_aprobadas_servicio %}<div class="stat-sub" style="color:#166534;">{% if solicitud.tipo == 'transporte' %}Transporte: {{ solicitud.id_recorrido.nombre }}{% else %}Comedor{% endif %} · Tu solicitud fue aprobada.</div>{% endfor %}</div>{% endif %}
         </div>
 
         <!-- DEPORTES -->
@@ -711,11 +729,15 @@
       if (el) {
         el.classList.add('active');
       }
+      const url = new URL(window.location.href);
+      if (id === 'inicio') url.searchParams.delete('panel');
+      else url.searchParams.set('panel', id);
+      window.history.replaceState({}, '', url);
     }
 
     document.addEventListener("DOMContentLoaded", function () {
 
-      const panelActivo = "{{ panel_activo|default:'inicio' }}";
+      const panelActivo = new URLSearchParams(window.location.search).get('panel') || "{{ panel_activo|default:'inicio' }}";
 
       document.querySelectorAll('.panel').forEach(
         p => p.classList.remove('active')

@@ -170,6 +170,14 @@
             </a>
             <a
               href="#"
+              id="enlace-servicios-admin"
+              class="{% if panel_activo == 'servicios-admin' %}active{% endif %}"
+              onclick="showPanel('servicios-admin', this); return false;"
+            >
+              <span class="nav-icon">🚌</span> Servicios
+            </a>
+            <a
+              href="#"
               onclick="
                 showPanel('opiniones', this);
                 return false;
@@ -824,6 +832,99 @@
               <section style="background:#f8fafc; border-radius:12px; padding:18px;"><h3>Grupos deportivos</h3><form method="POST" action="{% url 'alta-grupo-deportivo-admin' %}">{% csrf_token %}<div class="form-group"><label>Deporte</label><select name="id_disciplina" required><option value="">Seleccione</option>{% for deporte in deportes_academicos %}<option value="{{ deporte.id_disciplina }}">{{ deporte.nombre }}</option>{% endfor %}</select></div><div class="form-group"><label>Nivel</label><select name="nivel_educativo" required><option value="">Seleccione</option>{% for nivel in niveles_educativos %}<option value="{{ nivel.id_nivel }}">{{ nivel.nombre }}</option>{% endfor %}</select></div><div class="form-group"><label>Profesor responsable</label><select name="profesor_responsable" required><option value="">Seleccione</option>{% for docente in docentes_deportivos %}<option value="{{ docente.legajo }}">{{ docente.id_persona.apellido }}, {{ docente.id_persona.nombre }}</option>{% endfor %}</select></div><div class="form-grid"><div class="form-group"><label>Día</label><select name="dia_semana" required><option value="lunes">Lunes</option><option value="martes">Martes</option><option value="miércoles">Miércoles</option><option value="jueves">Jueves</option><option value="viernes">Viernes</option></select></div><div class="form-group"><label>Turno</label><select name="turno" required><option value="Mañana">Mañana</option><option value="Tarde">Tarde</option></select></div><div class="form-group"><label>Inicio</label><input type="time" name="hora_inicio" required></div><div class="form-group"><label>Fin</label><input type="time" name="hora_fin" required></div><div class="form-group"><label>Cupo</label><input type="number" name="cupo_maximo" min="1"></div></div><button class="btn-form" style="margin-top:10px;">Crear grupo</button></form>{% for grupo in grupos_deportivos_admin %}<div style="background:white; border:1px solid #e2e8f0; border-radius:8px; padding:10px; margin-top:10px;"><strong>{{ grupo.id_disciplina.nombre }}</strong> · {{ grupo.nivel_educativo.nombre }} · {{ grupo.dia_semana|capfirst }} · {{ grupo.turno }} · {{ grupo.hora_inicio|time:'H:i' }}-{{ grupo.hora_fin|time:'H:i' }}<br><small>Responsable: {{ grupo.profesor_responsable.id_persona.apellido }}, {{ grupo.profesor_responsable.id_persona.nombre }} · {{ grupo.cantidad_inscriptos }} {% if grupo.cupo_maximo %}/{{ grupo.cupo_maximo }}{% endif %}</small><button type="button" class="btn-small" style="background:#1d66c4; margin:6px 0 0 8px;" onclick="toggleDisplay('inscriptos-grupo-{{ grupo.id_grupo }}')">Ver alumnos inscriptos</button><div id="inscriptos-grupo-{{ grupo.id_grupo }}" style="display:none; margin-top:8px; padding:8px; background:#f8fafc; border-radius:6px;">{% for inscripcion in grupo.inscriptos_activos %}<div>{{ inscripcion.id_alumno.id_persona.apellido }}, {{ inscripcion.id_alumno.id_persona.nombre }}</div>{% empty %}<div style="color:#64748b;">No hay alumnos inscriptos activos.</div>{% endfor %}</div><form method="POST" action="{% url 'baja-grupo-deportivo-admin' grupo.id_grupo %}" style="display:inline; margin-left:8px;" onsubmit="return confirm('¿Eliminar este grupo?');">{% csrf_token %}<button class="btn-small" style="background:#dc2626; margin-top:6px;">Baja</button></form></div>{% empty %}<p>No hay grupos registrados.</p>{% endfor %}</section>
               <section style="background:#f8fafc; border-radius:12px; padding:18px;"><h3>Inscribir alumno</h3><form method="POST" action="{% url 'alta-inscripcion-deportiva-admin' %}">{% csrf_token %}<div class="form-group"><label>Alumno</label><select name="legajo_alumno" required><option value="">Seleccione</option>{% for alumno in alumnos_deportivos %}<option value="{{ alumno.legajo }}">{{ alumno.id_persona.apellido }}, {{ alumno.id_persona.nombre }}</option>{% endfor %}</select></div><div class="form-group" style="margin-top:8px;"><label>Grupo deportivo</label><select name="id_grupo" required><option value="">Seleccione</option>{% for grupo in grupos_deportivos_admin %}<option value="{{ grupo.id_grupo }}">{{ grupo.id_disciplina.nombre }} · {{ grupo.nivel_educativo.nombre }} · {{ grupo.dia_semana|capfirst }} · {{ grupo.turno }} · {{ grupo.hora_inicio|time:'H:i' }}-{{ grupo.hora_fin|time:'H:i' }}</option>{% endfor %}</select></div><button class="btn-form" style="margin-top:10px;">Inscribir alumno</button></form><p style="color:#64748b; margin-top:12px;">El sistema valida máximo dos deportes, cupo y conflictos de horarios.</p></section>
             </div>
+          </div>
+
+          <!-- Panel de Servicios -->
+          <div id="servicios-admin" class="panel {% if panel_activo == 'servicios-admin' %}active{% endif %}">
+            <style>
+              #servicios-admin { background:#fff; border-radius:16px; padding:28px; box-shadow:0 4px 14px rgba(15,23,42,.06); font-family:inherit; color:#0f172a; }
+              #servicios-admin .service-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:20px; margin-top:20px; }
+              #servicios-admin .service-card { background:#f8fafc; border:1px solid #e2e8f0; border-radius:14px; padding:20px; }
+              #servicios-admin .service-card h3, #servicios-admin .service-block h3 { margin:0 0 14px; color:#0f172a; }
+              #servicios-admin .service-form { display:grid; gap:12px; }
+              #servicios-admin .service-form label { display:flex; flex-direction:column; gap:6px; color:#334155; font-size:14px; font-weight:600; }
+              #servicios-admin .service-form input, #servicios-admin .service-form select { width:100%; box-sizing:border-box; min-height:48px; padding:0 16px; font-family:inherit; font-size:16px; color:#0f172a; background:#f8fafc; border:1px solid #cbd5e1; border-radius:12px; outline:none; }
+              #servicios-admin .service-form input:focus, #servicios-admin .service-form select:focus { border-color:#2563eb; box-shadow:0 0 0 3px rgba(37,99,235,.12); }
+              #servicios-admin .resultado-alumno-servicio { min-height:42px; padding:10px 12px; border-radius:10px; background:#f1f5f9; color:#64748b; font-size:14px; }
+              #servicios-admin .resultado-alumno-servicio.encontrado { background:#dcfce7; color:#166534; }
+              #servicios-admin .resultado-alumno-servicio.error { background:#fee2e2; color:#991b1b; }
+              #servicios-admin .service-form .btn-form { width:max-content; margin-top:4px; }
+              #servicios-admin .service-block { margin-top:20px; background:#f8fafc; border:1px solid #e2e8f0; border-radius:14px; padding:20px; }
+              #servicios-admin .manual-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:24px; }
+              #servicios-admin .manual-card { background:#fff; border:1px solid #e2e8f0; border-radius:12px; padding:18px; }
+              #servicios-admin .manual-card h4 { margin:0 0 14px; color:#1e3a8a; font-size:16px; }
+              #servicios-admin .service-list-item { background:#fff; border:1px solid #e2e8f0; border-radius:10px; padding:12px 14px; margin-top:9px; display:flex; justify-content:space-between; align-items:center; gap:12px; }
+              #servicios-admin .service-list-item form { flex-shrink:0; }
+              @media (max-width:760px) { #servicios-admin .service-grid, #servicios-admin .manual-grid { grid-template-columns:1fr; } #servicios-admin { padding:18px; } }
+            </style>
+            <h2 class="section-title">🚌 Gestión de transporte y comedor</h2>
+            {% if messages %}<div style="margin:14px 0 18px;">{% for message in messages %}<div style="padding:12px 16px;border-radius:10px;margin-bottom:8px;font-weight:600;{% if message.tags == 'error' %}background:#fee2e2;color:#991b1b;border:1px solid #fecaca;{% elif message.tags == 'success' %}background:#dcfce7;color:#166534;border:1px solid #bbf7d0;{% else %}background:#fef3c7;color:#92400e;border:1px solid #fde68a;{% endif %}">{{ message }}</div>{% endfor %}</div>{% endif %}
+            <p>Administrá recorridos, cupos e inscripciones. Las solicitudes enviadas por alumnos aparecen para aprobar o rechazar.</p>
+            <div class="service-grid">
+              <section class="service-card">
+                <h3>Nuevo recorrido</h3>
+                <form class="service-form" method="POST" action="{% url 'alta-recorrido-admin' %}">{% csrf_token %}
+                  <label>Nombre<input name="nombre" placeholder="Ej. Recorrido Norte" required maxlength="100"></label>
+                  <label>Descripción y paradas<input name="descripcion" placeholder="Ej. Barrio Norte - Escuela"></label>
+                  <label>Turno<select name="turno"><option>Mañana</option><option>Tarde</option></select></label>
+                  <label>Hora de salida<input type="time" name="hora_salida"></label>
+                  <label>Cupo máximo<input type="number" name="cupo_maximo" min="1" value="20" required></label>
+                  <button class="btn-form">Crear recorrido</button>
+                </form>
+              </section>
+              <section class="service-card">
+                <h3>Comedor escolar</h3>
+                <p style="margin:0 0 8px;color:#475569;">Cupo utilizado: <strong>{{ inscripciones_comedor_admin|length }} / {{ servicio_comedor_admin.cupo_maximo }}</strong></p>
+                <p style="margin:0 0 14px;color:#475569;">Estado: <strong style="color:{% if servicio_comedor_admin.estado == 'Activo' %}#166534{% else %}#991b1b{% endif %};">{{ servicio_comedor_admin.estado }}</strong></p>
+                <button type="button" class="btn-small" style="background:#d97706;margin:0;" onclick="toggleDisplay('editar-comedor')">Modificar</button>
+                <div id="editar-comedor" style="display:none;margin-top:16px;padding-top:16px;border-top:1px solid #e2e8f0;">
+                  <form class="service-form" method="POST" action="{% url 'modificar-comedor-admin' %}">{% csrf_token %}
+                    <label>Cupo máximo<input type="number" name="cupo_maximo" min="1" value="{{ servicio_comedor_admin.cupo_maximo }}" required></label>
+                    <label>Estado<select name="estado"><option value="Activo" {% if servicio_comedor_admin.estado == 'Activo' %}selected{% endif %}>Activo</option><option value="Inactivo" {% if servicio_comedor_admin.estado == 'Inactivo' %}selected{% endif %}>Inactivo</option></select></label>
+                    <button class="btn-form">Guardar cambios</button>
+                  </form>
+                </div>
+              </section>
+            </div>
+            <section class="service-block">
+              <h3>Inscripción manual</h3>
+              <div class="manual-grid">
+                <div class="manual-card"><h4>Inscribir al transporte</h4><form class="service-form service-enrollment-form" method="POST" action="{% url 'alta-inscripcion-transporte-admin' %}" data-lookup-url="{% url 'buscar-alumno-servicio' %}">{% csrf_token %}<label>DNI del alumno<input class="dni-alumno-servicio" name="dni_alumno" inputmode="numeric" maxlength="20" placeholder="Ej. 70000041" required></label><input type="hidden" name="legajo_alumno" class="legajo-alumno-servicio"><div class="resultado-alumno-servicio">Ingresá un DNI para verificar el alumno.</div><label>Recorrido<select name="id_recorrido" required><option value="">Seleccione un recorrido</option>{% for recorrido in recorridos_transporte_admin %}{% if recorrido.estado == 'Activo' %}<option value="{{ recorrido.id_recorrido }}">{{ recorrido.nombre }} ({{ recorrido.cupos_ocupados }}/{{ recorrido.cupo_maximo }})</option>{% endif %}{% endfor %}</select></label><button class="btn-form" disabled>Inscribir transporte</button></form></div>
+                <div class="manual-card"><h4>Inscribir al comedor</h4><form class="service-form service-enrollment-form" method="POST" action="{% url 'alta-inscripcion-comedor-admin' %}" data-lookup-url="{% url 'buscar-alumno-servicio' %}">{% csrf_token %}<label>DNI del alumno<input class="dni-alumno-servicio" name="dni_alumno" inputmode="numeric" maxlength="20" placeholder="Ej. 70000041" required></label><input type="hidden" name="legajo_alumno" class="legajo-alumno-servicio"><div class="resultado-alumno-servicio">Ingresá un DNI para verificar el alumno.</div><button class="btn-form" disabled>Inscribir comedor</button></form></div>
+              </div>
+            </section>
+            <section class="service-block"><h3>Solicitudes pendientes</h3>
+              {% for solicitud in solicitudes_servicio_admin %}<div style="background:white;border:1px solid #e2e8f0;border-radius:8px;padding:10px;margin-top:8px;"><strong>{{ solicitud.id_alumno.id_persona.apellido }}, {{ solicitud.id_alumno.id_persona.nombre }}</strong> · DNI {{ solicitud.id_alumno.id_persona.dni }} · {% if solicitud.tipo == 'transporte' %}{{ solicitud.id_recorrido.nombre }}{% else %}Comedor{% endif %}<form method="POST" action="{% url 'gestionar-solicitud-servicio-admin' solicitud.id_solicitud %}" style="display:inline;float:right;">{% csrf_token %}<button name="decision" value="aprobar" class="btn-small" style="background:#16a34a;margin:0;">Aceptar</button><button name="decision" value="rechazar" class="btn-small" style="background:#dc2626;margin:0;">Denegar</button></form></div>{% empty %}<p>No hay solicitudes pendientes.</p>{% endfor %}
+            </section>
+            <section class="service-block"><h3>Inscripciones activas</h3>
+              {% for recorrido in recorridos_transporte_admin %}
+                <div class="service-list-item"><div><strong>{{ recorrido.nombre }}</strong><br><small>{{ recorrido.cupos_ocupados }}/{{ recorrido.cupo_maximo }} inscriptos</small></div><button type="button" class="btn-small" style="background:#1d66c2;margin:0;" onclick="toggleDisplay('inscriptos-recorrido-{{ recorrido.id_recorrido }}')">Ver alumnos</button></div>
+                <div id="inscriptos-recorrido-{{ recorrido.id_recorrido }}" style="display:none;margin:0 0 10px;padding:10px 14px;background:#fff;border:1px solid #e2e8f0;border-radius:10px;">
+                  {% for inscripcion in inscripciones_transporte_admin %}{% if inscripcion.id_recorrido_id == recorrido.id_recorrido %}<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:6px;"> <span>{{ inscripcion.id_alumno.id_persona.apellido }}, {{ inscripcion.id_alumno.id_persona.nombre }} · DNI {{ inscripcion.id_alumno.id_persona.dni }}</span><form method="POST" action="{% url 'baja-inscripcion-transporte-admin' inscripcion.id_inscripcion %}">{% csrf_token %}<button class="btn-small" style="background:#dc2626;margin:0;" onclick="return confirm('¿Dar de baja a este alumno del recorrido?');">Dar de baja</button></form></div>{% endif %}{% empty %}<span style="color:#64748b;">No hay alumnos inscriptos.</span>{% endfor %}
+                </div>
+              {% empty %}<p>No hay recorridos configurados.</p>{% endfor %}
+              <div class="service-list-item"><div><strong>Comedor escolar</strong><br><small>{{ inscripciones_comedor_admin|length }} / {{ servicio_comedor_admin.cupo_maximo }} inscriptos</small></div><button type="button" class="btn-small" style="background:#1d66c2;margin:0;" onclick="toggleDisplay('inscriptos-comedor')">Ver alumnos</button></div>
+              <div id="inscriptos-comedor" style="display:none;margin:0 0 10px;padding:10px 14px;background:#fff;border:1px solid #e2e8f0;border-radius:10px;">{% for inscripcion in inscripciones_comedor_admin %}<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:6px;"><span>{{ inscripcion.id_alumno.id_persona.apellido }}, {{ inscripcion.id_alumno.id_persona.nombre }} · DNI {{ inscripcion.id_alumno.id_persona.dni }}</span><form method="POST" action="{% url 'baja-inscripcion-comedor-admin' inscripcion.id_inscripcion %}">{% csrf_token %}<button class="btn-small" style="background:#dc2626;margin:0;" onclick="return confirm('¿Dar de baja a este alumno del comedor?');">Dar de baja</button></form></div>{% empty %}<span style="color:#64748b;">No hay alumnos inscriptos.</span>{% endfor %}</div>
+            </section>
+            <section class="service-block"><h3>Recorridos configurados</h3>
+              {% for recorrido in recorridos_transporte_admin %}
+                <div class="service-list-item">
+                  <div><strong>{{ recorrido.nombre }}</strong><br><small>{{ recorrido.turno }} · {{ recorrido.cupos_ocupados }}/{{ recorrido.cupo_maximo }} · {{ recorrido.estado }}</small></div>
+                  <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;justify-content:flex-end;">
+                    <button type="button" class="btn-small" style="background:#d97706;margin:0;" onclick="toggleDisplay('editar-recorrido-{{ recorrido.id_recorrido }}')">Editar</button>
+                    {% if recorrido.estado == 'Activo' %}
+                      <form method="POST" action="{% url 'baja-recorrido-admin' recorrido.id_recorrido %}" style="display:inline;">{% csrf_token %}<button class="btn-small" style="background:#dc2626;margin:0;" onclick="return confirm('¿Dar de baja este recorrido?');">Baja</button></form>
+                    {% else %}
+                      <form method="POST" action="{% url 'alta-recorrido-existente-admin' recorrido.id_recorrido %}" style="display:inline;">{% csrf_token %}<button class="btn-small" style="background:#16a34a;margin:0;">Alta</button></form>
+                      <form method="POST" action="{% url 'eliminar-recorrido-admin' recorrido.id_recorrido %}" style="display:inline;">{% csrf_token %}<button class="btn-small" style="background:#991b1b;margin:0;" onclick="return confirm('¿Eliminar definitivamente este recorrido?');">Eliminar</button></form>
+                    {% endif %}
+                  </div>
+                  <div id="editar-recorrido-{{ recorrido.id_recorrido }}" style="display:none;grid-column:1/-1;margin-top:10px;padding-top:12px;border-top:1px solid #e2e8f0;">
+                    <form class="service-form" method="POST" action="{% url 'modificar-recorrido-admin' recorrido.id_recorrido %}">{% csrf_token %}<label>Nombre<input name="nombre" value="{{ recorrido.nombre }}" required></label><label>Descripción<input name="descripcion" value="{{ recorrido.descripcion|default:'' }}"></label><label>Turno<select name="turno"><option {% if recorrido.turno == 'Mañana' %}selected{% endif %}>Mañana</option><option {% if recorrido.turno == 'Tarde' %}selected{% endif %}>Tarde</option></select></label><label>Hora de salida<input type="time" name="hora_salida" value="{{ recorrido.hora_salida|time:'H:i' }}"></label><label>Cupo máximo<input type="number" name="cupo_maximo" min="1" value="{{ recorrido.cupo_maximo }}" required></label><input type="hidden" name="estado" value="{{ recorrido.estado }}"><button class="btn-form">Guardar cambios</button></form>
+                  </div>
+                </div>
+              {% empty %}<p>No hay recorridos configurados.</p>{% endfor %}
+            </section>
           </div>
 
           <!-- Panel de Horarios -->
@@ -1847,7 +1948,7 @@
         document.querySelectorAll(".panel").forEach((p) => p.classList.remove("active"));
         document.querySelectorAll(".sidebar-nav a").forEach((a) => a.classList.remove("active"));
 
-        const targetPanel = document.getElementById("panel-" + id);
+        const targetPanel = document.getElementById("panel-" + id) || document.getElementById(id);
         if (targetPanel) {
             targetPanel.classList.add("active");
         }
@@ -1955,6 +2056,16 @@
           return;
         }
 
+        if (panel === "servicios-admin") {
+          document.querySelectorAll(".panel").forEach((p) => p.classList.remove("active"));
+          document.querySelectorAll(".sidebar-nav a").forEach((a) => a.classList.remove("active"));
+          const panelServicios = document.getElementById("servicios-admin");
+          if (panelServicios) panelServicios.classList.add("active");
+          const enlaceServicios = document.getElementById("enlace-servicios-admin");
+          if (enlaceServicios) enlaceServicios.classList.add("active");
+          return;
+        }
+
         // Para los demás paneles que usan onclick
         const enlace = document.querySelector(
           `.sidebar-nav a[onclick*="showPanel('${panel}'"]`,
@@ -2004,6 +2115,40 @@
             el.style.display = 'none';
         }
       }
+
+      document.addEventListener('DOMContentLoaded', function () {
+        document.querySelectorAll('.service-enrollment-form').forEach(function (form) {
+          const dni = form.querySelector('.dni-alumno-servicio');
+          const legajo = form.querySelector('.legajo-alumno-servicio');
+          const resultado = form.querySelector('.resultado-alumno-servicio');
+          const boton = form.querySelector('button');
+          let timer;
+          dni.addEventListener('input', function () {
+            clearTimeout(timer);
+            legajo.value = '';
+            boton.disabled = true;
+            resultado.className = 'resultado-alumno-servicio';
+            resultado.textContent = 'Buscando alumno...';
+            if (!dni.value.trim()) { resultado.textContent = 'Ingresá un DNI para verificar el alumno.'; return; }
+            timer = setTimeout(function () {
+              fetch(form.dataset.lookupUrl + '?dni=' + encodeURIComponent(dni.value.trim()), {headers: {'X-Requested-With': 'XMLHttpRequest'}})
+                .then(function (response) { return response.json(); })
+                .then(function (data) {
+                  if (data.ok) {
+                    legajo.value = data.legajo;
+                    resultado.className = 'resultado-alumno-servicio encontrado';
+                    resultado.textContent = data.nombre + ' · ' + data.curso + ' · Legajo ' + data.legajo;
+                    boton.disabled = false;
+                  } else {
+                    resultado.className = 'resultado-alumno-servicio error';
+                    resultado.textContent = data.error || 'No se encontró el alumno.';
+                  }
+                })
+                .catch(function () { resultado.className = 'resultado-alumno-servicio error'; resultado.textContent = 'No se pudo consultar el DNI.'; });
+            }, 300);
+          });
+        });
+      });
     </script>
   </body>
 </html>
