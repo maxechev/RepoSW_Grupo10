@@ -12,7 +12,7 @@ import re
 import resend
 import os
 from django.shortcuts import render, redirect
-from django.db.models import Avg
+from django.db.models import Avg, Q, Case, When, Value, IntegerField
 from django.db import transaction, IntegrityError
 import json
 from django.core.mail import EmailMessage
@@ -56,6 +56,7 @@ from .models import (
     NivelEducativo,
     GrupoDeportivo,
     InscripcionDeportiva,
+    Horario,
 )
 COMUNICADOS_FILE = os.path.join(
     os.path.dirname(__file__),
@@ -551,7 +552,7 @@ def dashboard_alumno(request):
     
     materias = CursoCursaMaterias.objects.filter(
         id_curso=alumno.id_curso
-    ).select_related('id_materia')
+    ).select_related('id_materia').prefetch_related('horarios_normalizados')
     
     # Procesar horarios para mostrar en el panel
     # Inicializar días en orden
@@ -581,9 +582,32 @@ def dashboard_alumno(request):
         }
         return mapping.get(d, d)
 
+    def _hora_orden(hora):
+        """Devuelve los minutos desde medianoche para ordenar la agenda."""
+        if isinstance(hora, (list, tuple)):
+            hora = hora[0] if hora else ''
+        coincidencia = re.search(r'(\d{1,2}):(\d{2})', str(hora))
+        if not coincidencia:
+            return 9999
+        return int(coincidencia.group(1)) * 60 + int(coincidencia.group(2))
+
     # Llenar con datos de las materias
     for materia in materias:
-        if materia.horarios:
+        horarios_normalizados = list(materia.horarios_normalizados.all())
+        if horarios_normalizados:
+            horario_items = []
+            for horario in horarios_normalizados:
+                dia_norm = _normalize_dia(horario.dia_semana)
+                hora = f'{horario.hora_inicio.strftime("%H:%M")} - {horario.hora_fin.strftime("%H:%M")}'
+                horario_items.append(f'{dia_norm.capitalize()}: {hora}')
+                if dia_norm in horario_por_dia:
+                    horario_por_dia[dia_norm].append({
+                        'materia': materia.id_materia.nombre,
+                        'hora': hora,
+                        'orden': _hora_orden(hora),
+                    })
+            materia.horario_formateado = ' | '.join(horario_items)
+        elif materia.horarios:
             try:
                 horarios = json.loads(materia.horarios)
 
@@ -597,7 +621,8 @@ def dashboard_alumno(request):
                     if dia_norm in horario_por_dia:
                         horario_por_dia[dia_norm].append({
                             'materia': materia.id_materia.nombre,
-                            'hora': hora
+                        'hora': hora,
+                        'orden': _hora_orden(hora),
                         })
 
                 materia.horario_formateado = " | ".join(horario_items)
@@ -623,6 +648,7 @@ def dashboard_alumno(request):
             horario_por_dia[dia].append({
                 'materia': grupo.id_disciplina.nombre,
                 'hora': f'{grupo.hora_inicio.strftime("%H:%M")} a {grupo.hora_fin.strftime("%H:%M")}',
+                'orden': grupo.hora_inicio.hour * 60 + grupo.hora_inicio.minute,
                 'es_deporte': True,
             })
     disciplina_horario_formateado = "Sin horario"
@@ -640,6 +666,7 @@ def dashboard_alumno(request):
                         horario_por_dia[dia_norm].append({
                             'materia': disciplina.nombre,
                             'hora': hora,
+                            'orden': _hora_orden(hora),
                             'es_deporte': True,
                         })
 
@@ -815,6 +842,8 @@ def dashboard_alumno(request):
     panel_activo = request.session.pop("panel_activo", "inicio")
     mensajes = list(get_messages(request))
     hay_horarios = any(clases for clases in horario_por_dia.values())
+    for clases in horario_por_dia.values():
+        clases.sort(key=lambda clase: clase.get('orden', 9999))
     
     alumno = Alumno.objects.select_related(
         'id_curso'
@@ -1403,8 +1432,53 @@ def dashboard_administrativo(request):
     docentes_deportivos = Docente.objects.select_related('id_persona').order_by(
         'id_persona__apellido', 'id_persona__nombre'
     )
+    cursos_materias_admin = CursoCursaMaterias.objects.select_related(
+        'id_curso__nivel_educativo', 'id_materia'
+    ).order_by('id_curso__nivel_educativo__nombre', 'id_curso__anio', 'id_curso__comision', 'id_materia__nombre')
+    horarios_admin = Horario.objects.select_related(
+        'curso_materia__id_curso__nivel_educativo', 'curso_materia__id_curso', 'curso_materia__id_materia',
+        'grupo_deportivo__id_disciplina', 'grupo_deportivo__nivel_educativo',
+    ).annotate(
+        dia_orden=Case(
+            When(dia_semana='lunes', then=Value(1)),
+            When(dia_semana='martes', then=Value(2)),
+            When(dia_semana__in=['miércoles', 'miercoles'], then=Value(3)),
+            When(dia_semana='jueves', then=Value(4)),
+            When(dia_semana='viernes', then=Value(5)),
+            default=Value(99),
+            output_field=IntegerField(),
+        )
+    ).order_by('dia_orden', 'hora_inicio')
+
+    # Permite consultar únicamente los horarios de un curso desde el panel.
+    # Los deportes se incluyen por nivel, ya que un grupo deportivo está
+    # asociado al nivel educativo y no a un curso puntual.
+    curso_horario_filtro = request.GET.get('curso_horario', '').strip()
+    curso_horario_seleccionado = None
+    if curso_horario_filtro.isdigit():
+        curso_horario_seleccionado = cursos_academicos.filter(
+            id_curso=int(curso_horario_filtro)
+        ).first()
+        if curso_horario_seleccionado:
+            horarios_admin = horarios_admin.filter(
+                Q(curso_materia__id_curso=curso_horario_seleccionado) |
+                Q(grupo_deportivo__nivel_educativo=curso_horario_seleccionado.nivel_educativo)
+            )
     
-    panel_activo = request.session.pop("panel_activo", "inicio")
+    # Se conserva el panel seleccionado para que una recarga no vuelva a
+    # mostrar Inicio. Los paneles abiertos con JavaScript también envían su
+    # nombre en la URL mediante history.replaceState.
+    paneles_validos = {
+        'inicio', 'inscripciones', 'pagos', 'documentacion', 'reservas',
+        'opiniones', 'noticias', 'usuarios', 'perfil', 'alumnos',
+        'profesores', 'niveles-cursos', 'materias', 'deportes-admin',
+        'horarios-admin', 'asistencia',
+    }
+    panel_activo = request.session.get("panel_activo", "inicio")
+    panel_solicitado = request.GET.get('panel')
+    if panel_solicitado in paneles_validos:
+        panel_activo = panel_solicitado
+        request.session['panel_activo'] = panel_activo
     mensajes = list(get_messages(request))
     
     return render(request, 'core/dashboard-administrativo.html', {
@@ -1427,6 +1501,10 @@ def dashboard_administrativo(request):
         'grupos_deportivos_admin': grupos_deportivos_admin,
         'alumnos_deportivos': alumnos_deportivos,
         'docentes_deportivos': docentes_deportivos,
+        'cursos_materias_admin': cursos_materias_admin,
+        'horarios_admin': horarios_admin,
+        'curso_horario_filtro': curso_horario_filtro,
+        'curso_horario_seleccionado': curso_horario_seleccionado,
         'panel_activo': panel_activo,
         'messages': mensajes,
     })
@@ -1438,7 +1516,7 @@ def lista_niveles_cursos_admin(request):
     if not persona or dashboard_url != 'dashboard-administrativo':
         return redirect('login')
     request.session['panel_activo'] = 'niveles-cursos'
-    return redirect('dashboard-administrativo')
+    return redirect(reverse('dashboard-administrativo') + '?panel=niveles-cursos')
 
 
 @never_cache
@@ -1447,7 +1525,7 @@ def lista_materias_admin(request):
     if not persona or dashboard_url != 'dashboard-administrativo':
         return redirect('login')
     request.session['panel_activo'] = 'materias'
-    return redirect('dashboard-administrativo')
+    return redirect(reverse('dashboard-administrativo') + '?panel=materias')
 
 
 def _validar_acceso_niveles(request):
@@ -1702,7 +1780,7 @@ def lista_deportes_admin(request):
     if not persona or dashboard_url != 'dashboard-administrativo':
         return redirect('login')
     request.session['panel_activo'] = 'deportes-admin'
-    return redirect('dashboard-administrativo')
+    return redirect(reverse('dashboard-administrativo') + '?panel=deportes-admin')
 
 
 def _hora_formulario(valor):
@@ -1710,6 +1788,15 @@ def _hora_formulario(valor):
         return datetime.strptime(valor or '', '%H:%M').time()
     except (TypeError, ValueError):
         raise ValueError('Las horas deben tener el formato HH:MM.')
+
+
+def _horarios_superpuestos(queryset, dia, inicio, fin, excluir=None):
+    for horario in queryset:
+        if excluir is not None and horario.id_horario == excluir:
+            continue
+        if horario.dia_semana.strip().lower() == dia.strip().lower() and max(horario.hora_inicio, inicio) < min(horario.hora_fin, fin):
+            return horario
+    return None
 
 
 @never_cache
@@ -1792,11 +1879,12 @@ def alta_grupo_deportivo_admin(request):
             deporte_id, nivel_id, profesor_id, dia, turno, inicio, fin, cupo = _datos_grupo_deportivo(request)
             if GrupoDeportivo.objects.filter(id_disciplina_id=deporte_id, nivel_educativo_id=nivel_id, dia_semana=dia, turno=turno, hora_inicio=inicio, hora_fin=fin).exists():
                 raise ValueError('Ya existe un grupo con ese deporte, nivel y horario.')
-            GrupoDeportivo.objects.create(
+            grupo = GrupoDeportivo.objects.create(
                 id_disciplina_id=deporte_id, nivel_educativo_id=nivel_id,
                 profesor_responsable_id=profesor_id, dia_semana=dia,
                 turno=turno, hora_inicio=inicio, hora_fin=fin, cupo_maximo=cupo,
             )
+            Horario.objects.create(grupo_deportivo=grupo, dia_semana=dia, hora_inicio=inicio, hora_fin=fin)
             messages.success(request, 'Grupo deportivo creado correctamente.')
         except (ValueError, IntegrityError) as error:
             messages.error(request, str(error))
@@ -1818,6 +1906,10 @@ def modificar_grupo_deportivo_admin(request, id_grupo):
             grupo.profesor_responsable_id, grupo.dia_semana, grupo.turno = profesor_id, dia, turno
             grupo.hora_inicio, grupo.hora_fin, grupo.cupo_maximo = inicio, fin, cupo
             grupo.save()
+            Horario.objects.update_or_create(
+                grupo_deportivo=grupo,
+                defaults={'dia_semana': dia, 'hora_inicio': inicio, 'hora_fin': fin},
+            )
             messages.success(request, 'Grupo deportivo actualizado correctamente.')
         except (ValueError, IntegrityError) as error:
             messages.error(request, str(error))
@@ -1836,6 +1928,101 @@ def baja_grupo_deportivo_admin(request, id_grupo):
             grupo.delete()
             messages.success(request, 'Grupo deportivo eliminado correctamente.')
     return redirect('lista-deportes-admin')
+
+
+@never_cache
+def lista_horarios_admin(request):
+    persona, dashboard_url = obtener_datos_sesion(request)
+    if not persona or dashboard_url != 'dashboard-administrativo':
+        return redirect('login')
+    request.session['panel_activo'] = 'horarios-admin'
+    return redirect(reverse('dashboard-administrativo') + '?panel=horarios-admin')
+
+
+def _datos_horario_admin(request):
+    tipo = request.POST.get('tipo')
+    dia = (request.POST.get('dia_semana') or '').strip().lower()
+    inicio = _hora_formulario(request.POST.get('hora_inicio'))
+    fin = _hora_formulario(request.POST.get('hora_fin'))
+    if tipo not in ('academico', 'deportivo') or not dia:
+        raise ValueError('Tipo y día son obligatorios.')
+    if inicio >= fin:
+        raise ValueError('La hora de finalización debe ser posterior a la de inicio.')
+    return tipo, dia, inicio, fin
+
+
+def _redirect_horarios_admin_con_filtro(request):
+    """Vuelve al listado de horarios conservando el curso seleccionado."""
+    url = reverse('dashboard-administrativo') + '?panel=horarios-admin'
+    curso_id = (request.POST.get('curso_horario') or request.GET.get('curso_horario') or '').strip()
+    if curso_id.isdigit():
+        url += f'&curso_horario={curso_id}'
+    return redirect(url)
+
+
+@never_cache
+def alta_horario_admin(request):
+    if not _validar_acceso_niveles(request):
+        return redirect('login')
+    if request.method == 'POST':
+        try:
+            tipo, dia, inicio, fin = _datos_horario_admin(request)
+            if tipo == 'academico':
+                relacion = get_object_or_404(CursoCursaMaterias, id=request.POST.get('curso_materia'))
+                existentes = Horario.objects.filter(curso_materia__id_curso=relacion.id_curso)
+                if _horarios_superpuestos(existentes, dia, inicio, fin):
+                    raise ValueError('El curso ya tiene otra actividad en ese horario.')
+                Horario.objects.create(curso_materia=relacion, dia_semana=dia, hora_inicio=inicio, hora_fin=fin)
+            else:
+                grupo = get_object_or_404(GrupoDeportivo, id_grupo=request.POST.get('grupo_deportivo'))
+                existentes = Horario.objects.filter(grupo_deportivo__nivel_educativo=grupo.nivel_educativo)
+                if _horarios_superpuestos(existentes, dia, inicio, fin):
+                    raise ValueError('Ya existe una actividad deportiva superpuesta para ese nivel.')
+                Horario.objects.create(grupo_deportivo=grupo, dia_semana=dia, hora_inicio=inicio, hora_fin=fin)
+            messages.success(request, 'Horario creado correctamente.')
+        except (ValueError, IntegrityError) as error:
+            messages.error(request, str(error))
+    return _redirect_horarios_admin_con_filtro(request)
+
+
+@never_cache
+def modificar_horario_admin(request, id_horario):
+    if not _validar_acceso_niveles(request):
+        return redirect('login')
+    horario = get_object_or_404(Horario, id_horario=id_horario)
+    if request.method == 'POST':
+        try:
+            tipo, dia, inicio, fin = _datos_horario_admin(request)
+            if tipo == 'academico':
+                relacion = get_object_or_404(CursoCursaMaterias, id=request.POST.get('curso_materia'))
+                existentes = Horario.objects.filter(curso_materia__id_curso=relacion.id_curso)
+                horario.curso_materia, horario.grupo_deportivo = relacion, None
+            else:
+                grupo = get_object_or_404(GrupoDeportivo, id_grupo=request.POST.get('grupo_deportivo'))
+                existentes = Horario.objects.filter(grupo_deportivo__nivel_educativo=grupo.nivel_educativo)
+                horario.grupo_deportivo, horario.curso_materia = grupo, None
+            if _horarios_superpuestos(existentes, dia, inicio, fin, excluir=horario.id_horario):
+                raise ValueError('El nuevo horario se superpone con otra actividad.')
+            horario.dia_semana, horario.hora_inicio, horario.hora_fin = dia, inicio, fin
+            horario.save()
+            if horario.grupo_deportivo_id:
+                grupo = horario.grupo_deportivo
+                grupo.dia_semana, grupo.hora_inicio, grupo.hora_fin = dia, inicio, fin
+                grupo.save(update_fields=['dia_semana', 'hora_inicio', 'hora_fin'])
+            messages.success(request, 'Horario actualizado correctamente.')
+        except (ValueError, IntegrityError) as error:
+            messages.error(request, str(error))
+    return _redirect_horarios_admin_con_filtro(request)
+
+
+@never_cache
+def baja_horario_admin(request, id_horario):
+    if not _validar_acceso_niveles(request):
+        return redirect('login')
+    if request.method == 'POST':
+        get_object_or_404(Horario, id_horario=id_horario).delete()
+        messages.success(request, 'Horario eliminado correctamente.')
+    return _redirect_horarios_admin_con_filtro(request)
 
 
 @never_cache
