@@ -1,4 +1,7 @@
 import requests
+import json
+import os
+from urllib.parse import urlencode
 from django.http import JsonResponse
 import re
 from django.core.files.storage import FileSystemStorage
@@ -20,6 +23,7 @@ from django.core.mail import EmailMessage
 from django.core.exceptions import ValidationError
 from django.core.validators import validate_email
 from django.contrib import messages
+from django.contrib.auth.hashers import check_password, make_password
 from django.contrib.messages import get_messages
 from django.utils import timezone
 from datetime import date
@@ -66,16 +70,23 @@ from .models import (
     InscripcionComedor,
     SolicitudServicio,
 )
+from .patterns import GestionEscolarFacade
+
+MODELOS_FACHADA = {
+    'Alumno': Alumno,
+    'Usuario': Usuario,
+    'InscripcionTransporte': InscripcionTransporte,
+    'InscripcionComedor': InscripcionComedor,
+}
+
+
+def _fachada_escolar():
+    return GestionEscolarFacade(MODELOS_FACHADA)
+
 COMUNICADOS_FILE = os.path.join(
     os.path.dirname(__file__),
     'comunicados.json'
 )
-import json
-import os
-from urllib.parse import urlencode
-from django.db.models import Avg
-from django.views.decorators.cache import never_cache
-
 OPINIONES_FILE = os.path.join(os.path.dirname(__file__), 'opiniones.json')
 
 def obtener_persona(request):
@@ -628,16 +639,23 @@ def login(request):
                 'error': 'Debe seleccionar un tipo de usuario.'
             })
         try:
+            usuario = Usuario.objects.filter(
+                Q(nombre_usuario=usuario_input) | Q(correo=usuario_input)
+            ).first()
+            if not usuario:
+                raise Usuario.DoesNotExist
             try:
-                usuario = Usuario.objects.get(
-                    nombre_usuario=usuario_input,
-                    contrasenia=password
-                )
-            except Usuario.DoesNotExist:
-                usuario = Usuario.objects.get(
-                    correo=usuario_input,
-                    contrasenia=password
-                )
+                password_valida = check_password(password or '', usuario.contrasenia)
+            except (ValueError, TypeError):
+                password_valida = False
+            # Compatibilidad de transición: si todavía queda una contraseña
+            # antigua en texto plano, se actualiza a hash en el primer login.
+            if not password_valida and usuario.contrasenia == password:
+                usuario.contrasenia = make_password(password)
+                usuario.save(update_fields=['contrasenia'])
+                password_valida = True
+            if not password_valida:
+                raise Usuario.DoesNotExist
 
             if getattr(usuario, 'estado', 'Activo') != 'Activo':
                 return render(request, 'core/login.html', {
@@ -1512,6 +1530,14 @@ def dashboard_docente(request):
         if isinstance(data, str):
             data = json.loads(data)
         for dia, rango in data.items():
+            # Algunos horarios legacy guardan el rango como lista JSON;
+            # convertirlo a texto evita usar una lista como clave de dict.
+            if isinstance(rango, (list, tuple)):
+                rango = ' - '.join(str(parte) for parte in rango)
+            elif isinstance(rango, dict):
+                rango = ' - '.join(str(valor) for valor in rango.values())
+            else:
+                rango = str(rango)
             if rango not in horario_dict:
                 horario_dict[rango] = {
                     'Lunes': '-',
@@ -2081,8 +2107,8 @@ def dashboard_administrativo(request):
     reporte_nombre = tipos_reporte.get(reporte_tipo, '')
     reporte_filtro = reporte_filtros.get(reporte_tipo, '')
     reportes_alumnos = []
-    alumnos_reporte = Alumno.objects.select_related(
-        'id_persona', 'id_curso__nivel_educativo'
+    alumnos_reporte = _fachada_escolar().reporte_alumnos(
+        reporte_tipo, reporte_filtro
     ).prefetch_related(
         Prefetch(
             'inscripciones_deportivas',
@@ -3221,7 +3247,7 @@ def alta_profesor_admin(request):
         with transaction.atomic():
             usuario = Usuario.objects.create(
                 nombre_usuario=nombre_usuario,
-                contrasenia=contrasenia,
+                contrasenia=make_password(contrasenia),
                 correo=email,
                 rol='docente',
                 estado='Activo',
@@ -3605,11 +3631,11 @@ def crear_usuario(request):
     if error:
         messages.error(request, error, extra_tags='usuarios')
     else:
-        usuario = Usuario.objects.create(
+        usuario = _fachada_escolar().crear_usuario(
+            rol,
             nombre_usuario=nombre_usuario,
             contrasenia=contrasenia,
             correo=correo,
-            rol=rol,
             estado='Activo',
         )
         persona.id_usuario = usuario
@@ -3654,7 +3680,7 @@ def modificar_usuario_admin(request, id_usuario):
             usuario.rol = rol
             usuario.estado = estado if estado in ('Activo', 'Inactivo') else 'Activo'
             if contrasenia:
-                usuario.contrasenia = contrasenia
+                usuario.contrasenia = make_password(contrasenia)
             usuario.save()
             messages.success(request, 'Usuario modificado correctamente.', extra_tags='usuarios')
 
@@ -3750,7 +3776,7 @@ def alta_padre_admin(request):
             with transaction.atomic():
                 usuario = Usuario.objects.create(
                     nombre_usuario=nombre_usuario,
-                    contrasenia=contrasenia,
+                    contrasenia=make_password(contrasenia),
                     correo=email or None,
                     rol='padre',
                     estado='Activo',
@@ -3909,7 +3935,7 @@ def dashboard_padres(request):
     def parse_fecha(c):
         try:
             return datetime.strptime(c.get("fecha", ""), '%d/%m/%Y %H:%M')
-        except:
+        except (ValueError, TypeError):
             return datetime.min
 
     if os.path.exists(COMUNICADOS_FILE):
@@ -5220,7 +5246,7 @@ def alta_alumno_admin(request):
         try:
             usuario = Usuario.objects.create(
                 nombre_usuario=nombre_usuario,
-                contrasenia=contrasenia,
+                contrasenia=make_password(contrasenia),
                 correo=email if email else None,
                 rol='alumno',
                 estado='Activo',
