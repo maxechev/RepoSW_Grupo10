@@ -1,4 +1,7 @@
 import requests
+import json
+import os
+from urllib.parse import urlencode
 from django.http import JsonResponse
 import re
 from django.core.files.storage import FileSystemStorage
@@ -12,12 +15,15 @@ import re
 import resend
 import os
 from django.shortcuts import render, redirect
-from django.db.models import Avg, Q, Case, When, Value, IntegerField
+from django.db.models import Avg, Q, Case, When, Value, IntegerField, Prefetch
 from django.db import transaction, IntegrityError
 from django.db.models.deletion import ProtectedError
 import json
 from django.core.mail import EmailMessage
+from django.core.exceptions import ValidationError
+from django.core.validators import validate_email
 from django.contrib import messages
+from django.contrib.auth.hashers import check_password, make_password
 from django.contrib.messages import get_messages
 from django.utils import timezone
 from datetime import date
@@ -64,16 +70,23 @@ from .models import (
     InscripcionComedor,
     SolicitudServicio,
 )
+from .patterns import GestionEscolarFacade
+
+MODELOS_FACHADA = {
+    'Alumno': Alumno,
+    'Usuario': Usuario,
+    'InscripcionTransporte': InscripcionTransporte,
+    'InscripcionComedor': InscripcionComedor,
+}
+
+
+def _fachada_escolar():
+    return GestionEscolarFacade(MODELOS_FACHADA)
+
 COMUNICADOS_FILE = os.path.join(
     os.path.dirname(__file__),
     'comunicados.json'
 )
-import json
-import os
-from urllib.parse import urlencode
-from django.db.models import Avg
-from django.views.decorators.cache import never_cache
-
 OPINIONES_FILE = os.path.join(os.path.dirname(__file__), 'opiniones.json')
 
 def obtener_persona(request):
@@ -84,6 +97,52 @@ def obtener_persona(request):
 
     usuario = Usuario.objects.get(id=usuario_id)
     return Persona.objects.filter(id_usuario=usuario).first()
+
+
+@never_cache
+def actualizar_perfil(request):
+    """Actualiza únicamente los datos editables del perfil autenticado."""
+    persona, dashboard_url = obtener_datos_sesion(request)
+    if not persona or not dashboard_url:
+        return redirect('login')
+
+    if request.method != 'POST':
+        return redirect(dashboard_url)
+
+    telefono = (request.POST.get('telefono') or '').strip()
+    email = (request.POST.get('email') or '').strip().lower()
+    errores = []
+
+    if telefono and not _TELEFONO_REGEX.match(telefono):
+        errores.append(
+            'El teléfono debe contener solo números entre 8 y 15 dígitos.'
+        )
+    if email:
+        try:
+            validate_email(email)
+        except ValidationError:
+            errores.append('Ingresá un correo electrónico válido.')
+        if Usuario.objects.filter(correo__iexact=email).exclude(
+            id=persona.id_usuario_id
+        ).exists():
+            errores.append('El correo ya está asociado a otro usuario.')
+
+    for error in errores:
+        messages.error(request, error)
+
+    if not errores:
+        with transaction.atomic():
+            persona.telefono = telefono or None
+            persona.email = email or None
+            persona.save(update_fields=['telefono', 'email'])
+            if persona.id_usuario_id:
+                Usuario.objects.filter(id=persona.id_usuario_id).update(
+                    correo=email or None
+                )
+        messages.success(request, 'Tus datos de perfil fueron actualizados correctamente.')
+
+    request.session['panel_activo'] = 'perfil'
+    return redirect(reverse(dashboard_url) + '?panel=perfil')
 
 
 ROLES_USUARIO = {
@@ -580,16 +639,23 @@ def login(request):
                 'error': 'Debe seleccionar un tipo de usuario.'
             })
         try:
+            usuario = Usuario.objects.filter(
+                Q(nombre_usuario=usuario_input) | Q(correo=usuario_input)
+            ).first()
+            if not usuario:
+                raise Usuario.DoesNotExist
             try:
-                usuario = Usuario.objects.get(
-                    nombre_usuario=usuario_input,
-                    contrasenia=password
-                )
-            except Usuario.DoesNotExist:
-                usuario = Usuario.objects.get(
-                    correo=usuario_input,
-                    contrasenia=password
-                )
+                password_valida = check_password(password or '', usuario.contrasenia)
+            except (ValueError, TypeError):
+                password_valida = False
+            # Compatibilidad de transición: si todavía queda una contraseña
+            # antigua en texto plano, se actualiza a hash en el primer login.
+            if not password_valida and usuario.contrasenia == password:
+                usuario.contrasenia = make_password(password)
+                usuario.save(update_fields=['contrasenia'])
+                password_valida = True
+            if not password_valida:
+                raise Usuario.DoesNotExist
 
             if getattr(usuario, 'estado', 'Activo') != 'Activo':
                 return render(request, 'core/login.html', {
@@ -1464,6 +1530,14 @@ def dashboard_docente(request):
         if isinstance(data, str):
             data = json.loads(data)
         for dia, rango in data.items():
+            # Algunos horarios legacy guardan el rango como lista JSON;
+            # convertirlo a texto evita usar una lista como clave de dict.
+            if isinstance(rango, (list, tuple)):
+                rango = ' - '.join(str(parte) for parte in rango)
+            elif isinstance(rango, dict):
+                rango = ' - '.join(str(valor) for valor in rango.values())
+            else:
+                rango = str(rango)
             if rango not in horario_dict:
                 horario_dict[rango] = {
                     'Lunes': '-',
@@ -2011,6 +2085,346 @@ def dashboard_administrativo(request):
         )
     ).order_by('dia_orden', 'hora_inicio')
 
+    # HU13: reportes de alumnos. Se reutilizan las relaciones de las HUs
+    # anteriores; esta funcionalidad no agrega modelos ni migraciones.
+    reporte_tipo = (request.GET.get('reporte_tipo') or '').strip().lower()
+    reporte_filtros = {
+        'curso': (request.GET.get('reporte_curso') or '').strip(),
+        'materia': (request.GET.get('reporte_materia') or '').strip(),
+        'deporte': (request.GET.get('reporte_deporte') or '').strip(),
+        'nivel': (request.GET.get('reporte_nivel') or '').strip(),
+        'transporte': (request.GET.get('reporte_transporte') or '').strip(),
+        'comedor': (request.GET.get('reporte_comedor') or '').strip(),
+    }
+    tipos_reporte = {
+        'curso': 'Curso',
+        'materia': 'Materia',
+        'deporte': 'Deporte',
+        'nivel': 'Nivel educativo',
+        'transporte': 'Recorrido de transporte',
+        'comedor': 'Comedor',
+    }
+    reporte_nombre = tipos_reporte.get(reporte_tipo, '')
+    reporte_filtro = reporte_filtros.get(reporte_tipo, '')
+    reportes_alumnos = []
+    alumnos_reporte = _fachada_escolar().reporte_alumnos(
+        reporte_tipo, reporte_filtro
+    ).prefetch_related(
+        Prefetch(
+            'inscripciones_deportivas',
+            queryset=InscripcionDeportiva.objects.filter(
+                estado='Activa'
+            ).select_related('id_grupo__id_disciplina'),
+            to_attr='deportes_reporte',
+        ),
+        Prefetch(
+            'inscripciones_transporte',
+            queryset=InscripcionTransporte.objects.filter(
+                estado='Activa'
+            ).select_related('id_recorrido'),
+            to_attr='transportes_reporte',
+        ),
+        Prefetch(
+            'inscripciones_comedor',
+            queryset=InscripcionComedor.objects.filter(
+                estado='Activa'
+            ).select_related('id_servicio'),
+            to_attr='comedores_reporte',
+        ),
+    ).order_by('id_persona__apellido', 'id_persona__nombre')
+
+    if reporte_tipo == 'curso' and reporte_filtro.isdigit():
+        alumnos_reporte = alumnos_reporte.filter(id_curso_id=int(reporte_filtro))
+    elif reporte_tipo == 'materia' and reporte_filtro.isdigit():
+        alumnos_reporte = alumnos_reporte.filter(
+            id_curso__cursocursamaterias__id_materia=int(reporte_filtro)
+        ).distinct()
+    elif reporte_tipo == 'deporte' and reporte_filtro.isdigit():
+        alumnos_reporte = alumnos_reporte.filter(
+            inscripciones_deportivas__id_grupo__id_disciplina_id=int(reporte_filtro),
+            inscripciones_deportivas__estado='Activa',
+        ).distinct()
+    elif reporte_tipo == 'nivel' and reporte_filtro.isdigit():
+        alumnos_reporte = alumnos_reporte.filter(
+            id_curso__nivel_educativo_id=int(reporte_filtro)
+        )
+    elif reporte_tipo == 'transporte' and reporte_filtro.isdigit():
+        alumnos_reporte = alumnos_reporte.filter(
+            inscripciones_transporte__id_recorrido_id=int(reporte_filtro),
+            inscripciones_transporte__estado='Activa',
+        ).distinct()
+    elif reporte_tipo == 'comedor' and reporte_filtro.isdigit():
+        alumnos_reporte = alumnos_reporte.filter(
+            inscripciones_comedor__id_servicio_id=int(reporte_filtro),
+            inscripciones_comedor__estado='Activa',
+        ).distinct()
+
+    if reporte_tipo in tipos_reporte:
+        for alumno_reporte in alumnos_reporte:
+            deportes = [
+                inscripcion.id_grupo.id_disciplina.nombre
+                for inscripcion in alumno_reporte.deportes_reporte
+            ]
+            transportes = [
+                inscripcion.id_recorrido.nombre
+                for inscripcion in alumno_reporte.transportes_reporte
+            ]
+            comedores = [
+                inscripcion.id_servicio.nombre
+                for inscripcion in alumno_reporte.comedores_reporte
+            ]
+            materias = list(
+                CursoCursaMaterias.objects.filter(
+                    id_curso=alumno_reporte.id_curso
+                ).select_related('id_materia').values_list(
+                    'id_materia__nombre', flat=True
+                )
+            ) if alumno_reporte.id_curso_id else []
+            detalles = {
+                'curso': (
+                    f'{alumno_reporte.id_curso.nivel_educativo.nombre} '
+                    f'{alumno_reporte.id_curso.anio}° '
+                    f'{alumno_reporte.id_curso.comision}'
+                    if alumno_reporte.id_curso else 'Sin curso'
+                ),
+                'materia': ', '.join(materias) or 'Sin materias',
+                'deporte': ', '.join(deportes) or 'Sin deportes',
+                'nivel': (
+                    alumno_reporte.id_curso.nivel_educativo.nombre
+                    if alumno_reporte.id_curso else 'Sin nivel'
+                ),
+                'transporte': ', '.join(transportes) or 'Sin transporte',
+                'comedor': ', '.join(comedores) or 'Sin comedor',
+            }
+            reportes_alumnos.append({
+                'alumno': alumno_reporte,
+                'detalle': detalles.get(reporte_tipo, ''),
+            })
+
+    # HU14: reportes de docentes. Se usan las asignaciones existentes de
+    # materias/cursos y los horarios académicos normalizados.
+    reporte_docente_tipo = (
+        request.GET.get('reporte_docente_tipo') or ''
+    ).strip().lower()
+    reporte_docente_filtro = (
+        request.GET.get('reporte_docente_filtro') or ''
+    ).strip()
+    tipos_reporte_docentes = {
+        'nivel': 'Por nivel educativo',
+        'cursos': 'Cursos y materias a cargo',
+        'horarios': 'Horarios',
+    }
+    reporte_docente_nombre = tipos_reporte_docentes.get(
+        reporte_docente_tipo, ''
+    )
+    reportes_docentes = []
+    docentes_reporte = Docente.objects.select_related(
+        'id_persona'
+    ).prefetch_related(
+        Prefetch(
+            'docentedictamateria_set',
+            queryset=DocenteDictaMateria.objects.select_related(
+                'id_materia', 'id_curso__nivel_educativo'
+            ).order_by(
+                'id_curso__nivel_educativo__nombre',
+                'id_curso__anio',
+                'id_curso__comision',
+                'id_materia__nombre',
+            ),
+            to_attr='asignaciones_reporte',
+        ),
+    ).order_by('id_persona__apellido', 'id_persona__nombre')
+
+    if reporte_docente_tipo == 'nivel' and reporte_docente_filtro.isdigit():
+        docentes_reporte = docentes_reporte.filter(
+            docentedictamateria__id_curso__nivel_educativo_id=int(
+                reporte_docente_filtro
+            )
+        ).distinct()
+    elif reporte_docente_tipo == 'cursos' and reporte_docente_filtro.isdigit():
+        docentes_reporte = docentes_reporte.filter(
+            docentedictamateria__id_curso_id=int(reporte_docente_filtro)
+        ).distinct()
+
+    horarios_reporte = []
+    if reporte_docente_tipo == 'horarios':
+        horarios_reporte_query = Horario.objects.filter(
+            curso_materia__isnull=False
+        )
+        if reporte_docente_filtro in {
+            'lunes', 'martes', 'miércoles', 'miercoles', 'jueves', 'viernes'
+        }:
+            dias_filtro = (
+                ['miércoles', 'miercoles']
+                if reporte_docente_filtro in {'miércoles', 'miercoles'}
+                else [reporte_docente_filtro]
+            )
+            horarios_reporte_query = horarios_reporte_query.filter(
+                dia_semana__in=dias_filtro
+            )
+        horarios_reporte = list(
+            horarios_reporte_query.select_related(
+                'curso_materia__id_curso__nivel_educativo',
+                'curso_materia__id_curso',
+                'curso_materia__id_materia',
+            ).order_by('dia_semana', 'hora_inicio')
+        )
+
+    if reporte_docente_tipo in tipos_reporte_docentes:
+        for docente_reporte in docentes_reporte:
+            asignaciones = [
+                asignacion for asignacion in docente_reporte.asignaciones_reporte
+                if asignacion.id_curso_id
+            ]
+            niveles = sorted({
+                asignacion.id_curso.nivel_educativo.nombre
+                for asignacion in asignaciones
+            })
+            cursos = sorted({
+                f'{asignacion.id_curso.nivel_educativo.nombre} '
+                f'{asignacion.id_curso.anio}° '
+                f'{asignacion.id_curso.comision}'
+                for asignacion in asignaciones
+            })
+            materias = sorted({
+                asignacion.id_materia.nombre
+                for asignacion in asignaciones
+            })
+            claves_asignaciones = {
+                (asignacion.id_curso_id, asignacion.id_materia_id)
+                for asignacion in asignaciones
+            }
+            horarios = [
+                horario for horario in horarios_reporte
+                if (
+                    horario.curso_materia.id_curso_id,
+                    horario.curso_materia.id_materia_id,
+                ) in claves_asignaciones
+            ]
+            horarios_texto = [
+                f'{horario.dia_semana.capitalize()} '
+                f'{horario.hora_inicio.strftime("%H:%M")}-'
+                f'{horario.hora_fin.strftime("%H:%M")} — '
+                f'{horario.curso_materia.id_materia.nombre} — '
+                f'{horario.curso_materia.id_curso.nivel_educativo.nombre} '
+                f'{horario.curso_materia.id_curso.anio}° '
+                f'{horario.curso_materia.id_curso.comision}'
+                for horario in horarios
+            ]
+            if reporte_docente_tipo == 'horarios' and not horarios:
+                continue
+            detalles_docente = {
+                'nivel': ', '.join(niveles) or 'Sin nivel asignado',
+                'cursos': (
+                    f'Cursos: {", ".join(cursos) or "Sin cursos"} · '
+                    f'Materias: {", ".join(materias) or "Sin materias"}'
+                ),
+                'horarios': ' | '.join(horarios_texto) or 'Sin horarios cargados',
+            }
+            reportes_docentes.append({
+                'docente': docente_reporte,
+                'detalle': detalles_docente[reporte_docente_tipo],
+            })
+
+    # HU15: reporte avanzado de actividades extracurriculares. Todos los
+    # filtros son opcionales y se aplican sobre las inscripciones activas.
+    reporte_avanzado_generar = (
+        request.GET.get('generar_reporte_avanzado') == '1'
+    )
+    reporte_avanzado_filtros = {
+        'deporte': (request.GET.get('reporte_avanzado_deporte') or '').strip(),
+        'nivel': (request.GET.get('reporte_avanzado_nivel') or '').strip(),
+        'horario': (request.GET.get('reporte_avanzado_horario') or '').strip(),
+        'profesor': (request.GET.get('reporte_avanzado_profesor') or '').strip(),
+    }
+    horarios_deportivos_reporte = []
+    horarios_deportivos_vistos = set()
+    for grupo in grupos_deportivos_admin:
+        if grupo.estado != 'Activo':
+            continue
+        clave_horario = (
+            f'{grupo.dia_semana}|{grupo.hora_inicio.strftime("%H:%M")}|'
+            f'{grupo.hora_fin.strftime("%H:%M")}'
+        )
+        if clave_horario in horarios_deportivos_vistos:
+            continue
+        horarios_deportivos_vistos.add(clave_horario)
+        horarios_deportivos_reporte.append({
+            'valor': clave_horario,
+            'nombre': (
+                f'{grupo.dia_semana.capitalize()} '
+                f'{grupo.hora_inicio.strftime("%H:%M")}-'
+                f'{grupo.hora_fin.strftime("%H:%M")}'
+            ),
+        })
+    horarios_deportivos_reporte.sort(key=lambda horario: horario['nombre'])
+
+    reportes_avanzados = []
+    if reporte_avanzado_generar:
+        inscripciones_avanzadas = InscripcionDeportiva.objects.filter(
+            estado='Activa'
+        ).select_related(
+            'id_alumno__id_persona',
+            'id_alumno__id_curso__nivel_educativo',
+            'id_grupo__id_disciplina',
+            'id_grupo__nivel_educativo',
+            'id_grupo__profesor_responsable__id_persona',
+        ).order_by(
+            'id_alumno__id_persona__apellido',
+            'id_alumno__id_persona__nombre',
+        )
+        filtro_deporte = reporte_avanzado_filtros['deporte']
+        filtro_nivel = reporte_avanzado_filtros['nivel']
+        filtro_horario = reporte_avanzado_filtros['horario']
+        filtro_profesor = reporte_avanzado_filtros['profesor']
+
+        if filtro_deporte.isdigit():
+            inscripciones_avanzadas = inscripciones_avanzadas.filter(
+                id_grupo__id_disciplina_id=int(filtro_deporte)
+            )
+        if filtro_nivel.isdigit():
+            inscripciones_avanzadas = inscripciones_avanzadas.filter(
+                id_grupo__nivel_educativo_id=int(filtro_nivel)
+            )
+        if filtro_profesor.isdigit():
+            inscripciones_avanzadas = inscripciones_avanzadas.filter(
+                id_grupo__profesor_responsable_id=int(filtro_profesor)
+            )
+        if filtro_horario:
+            partes_horario = filtro_horario.split('|')
+            if len(partes_horario) == 3:
+                inscripciones_avanzadas = inscripciones_avanzadas.filter(
+                    id_grupo__dia_semana__in=(
+                        [partes_horario[0], 'miercoles']
+                        if partes_horario[0] == 'miércoles'
+                        else [partes_horario[0]]
+                    ),
+                    id_grupo__hora_inicio=partes_horario[1],
+                    id_grupo__hora_fin=partes_horario[2],
+                )
+
+        for inscripcion in inscripciones_avanzadas:
+            grupo = inscripcion.id_grupo
+            alumno = inscripcion.id_alumno
+            reportes_avanzados.append({
+                'alumno': alumno,
+                'deporte': grupo.id_disciplina.nombre,
+                'nivel': grupo.nivel_educativo.nombre,
+                'curso': (
+                    f'{alumno.id_curso.anio}° {alumno.id_curso.comision}'
+                    if alumno.id_curso else 'Sin curso'
+                ),
+                'horario': (
+                    f'{grupo.dia_semana.capitalize()} '
+                    f'{grupo.hora_inicio.strftime("%H:%M")}-'
+                    f'{grupo.hora_fin.strftime("%H:%M")}'
+                ),
+                'profesor': (
+                    f'{grupo.profesor_responsable.id_persona.apellido}, '
+                    f'{grupo.profesor_responsable.id_persona.nombre}'
+                ),
+            })
+
     # Permite consultar únicamente los horarios de un curso desde el panel.
     # Los deportes se incluyen por nivel, ya que un grupo deportivo está
     # asociado al nivel educativo y no a un curso puntual.
@@ -2025,6 +2439,24 @@ def dashboard_administrativo(request):
                 Q(curso_materia__id_curso=curso_horario_seleccionado) |
                 Q(grupo_deportivo__nivel_educativo=curso_horario_seleccionado.nivel_educativo)
             )
+
+    tutores_admin = Tutor.objects.select_related(
+        'id_persona', 'id_persona__id_usuario'
+    ).prefetch_related(
+        Prefetch(
+            'tutortutoraalumno_set',
+            queryset=TutorTutoraAlumno.objects.select_related(
+                'id_alumno__id_persona', 'id_alumno__id_curso__nivel_educativo'
+            ).order_by(
+                'id_alumno__id_persona__apellido',
+                'id_alumno__id_persona__nombre',
+            ),
+            to_attr='hijos_admin',
+        )
+    ).order_by('id_persona__apellido', 'id_persona__nombre')
+    alumnos_tutores_admin = Alumno.objects.select_related(
+        'id_persona', 'id_curso__nivel_educativo'
+    ).order_by('id_persona__apellido', 'id_persona__nombre')
     
     # Se conserva el panel seleccionado para que una recarga no vuelva a
     # mostrar Inicio. Los paneles abiertos con JavaScript también envían su
@@ -2034,6 +2466,8 @@ def dashboard_administrativo(request):
         'opiniones', 'noticias', 'usuarios', 'perfil', 'alumnos',
         'profesores', 'niveles-cursos', 'materias', 'deportes-admin',
         'horarios-admin', 'servicios-admin', 'asistencia',
+        'reportes', 'reportes-docentes', 'reportes-avanzados',
+        'padres-admin',
     }
     panel_activo = request.session.get("panel_activo", "inicio")
     panel_solicitado = request.GET.get('panel')
@@ -2077,6 +2511,22 @@ def dashboard_administrativo(request):
         'usuario_busqueda': usuario_busqueda,
         'usuario_rol_filtro': usuario_rol_filtro,
         'usuario_estado_filtro': usuario_estado_filtro,
+        'tipos_reporte': tipos_reporte,
+        'reporte_tipo': reporte_tipo,
+        'reporte_filtros': reporte_filtros,
+        'reporte_nombre': reporte_nombre,
+        'reportes_alumnos': reportes_alumnos,
+        'tipos_reporte_docentes': tipos_reporte_docentes,
+        'reporte_docente_tipo': reporte_docente_tipo,
+        'reporte_docente_filtro': reporte_docente_filtro,
+        'reportes_docentes': reportes_docentes,
+        'reporte_docente_nombre': reporte_docente_nombre,
+        'reporte_avanzado_generar': reporte_avanzado_generar,
+        'reporte_avanzado_filtros': reporte_avanzado_filtros,
+        'horarios_deportivos_reporte': horarios_deportivos_reporte,
+        'reportes_avanzados': reportes_avanzados,
+        'tutores_admin': tutores_admin,
+        'alumnos_tutores_admin': alumnos_tutores_admin,
     })
 
 
@@ -2797,7 +3247,7 @@ def alta_profesor_admin(request):
         with transaction.atomic():
             usuario = Usuario.objects.create(
                 nombre_usuario=nombre_usuario,
-                contrasenia=contrasenia,
+                contrasenia=make_password(contrasenia),
                 correo=email,
                 rol='docente',
                 estado='Activo',
@@ -3181,11 +3631,11 @@ def crear_usuario(request):
     if error:
         messages.error(request, error, extra_tags='usuarios')
     else:
-        usuario = Usuario.objects.create(
+        usuario = _fachada_escolar().crear_usuario(
+            rol,
             nombre_usuario=nombre_usuario,
             contrasenia=contrasenia,
             correo=correo,
-            rol=rol,
             estado='Activo',
         )
         persona.id_usuario = usuario
@@ -3230,7 +3680,7 @@ def modificar_usuario_admin(request, id_usuario):
             usuario.rol = rol
             usuario.estado = estado if estado in ('Activo', 'Inactivo') else 'Activo'
             if contrasenia:
-                usuario.contrasenia = contrasenia
+                usuario.contrasenia = make_password(contrasenia)
             usuario.save()
             messages.success(request, 'Usuario modificado correctamente.', extra_tags='usuarios')
 
@@ -3255,6 +3705,112 @@ def baja_usuario_admin(request, id_usuario):
 
     request.session['panel_activo'] = 'usuarios'
     return redireccion_usuarios_con_filtro(request)
+
+
+@never_cache
+def alta_padre_admin(request):
+    persona_sesion, dashboard_url = obtener_datos_sesion(request)
+    if not persona_sesion or dashboard_url != 'dashboard-administrativo':
+        return redirect('login')
+
+    if request.method == 'POST':
+        nombre = (request.POST.get('nombre') or '').strip()
+        apellido = (request.POST.get('apellido') or '').strip()
+        dni = (request.POST.get('dni') or '').strip()
+        fecha_nacimiento = (request.POST.get('fecha_nacimiento') or '').strip()
+        direccion = (request.POST.get('direccion') or '').strip()
+        telefono = (request.POST.get('telefono') or '').strip()
+        email = (request.POST.get('email') or '').strip().lower()
+        nombre_usuario = (request.POST.get('nombre_usuario') or '').strip()
+        contrasenia = request.POST.get('contrasenia') or ''
+        parentesco = (request.POST.get('parentesco') or '').strip()
+        hijos_ids = list(dict.fromkeys(request.POST.getlist('hijos')))
+        errores = []
+
+        for valor, etiqueta in ((nombre, 'nombre'), (apellido, 'apellido')):
+            if not valor:
+                errores.append(f'El {etiqueta} del padre/tutor es obligatorio.')
+            elif not _NOMBRE_REGEX.match(valor):
+                errores.append(f'El {etiqueta} solo puede contener letras y espacios.')
+        if not _DNI_REGEX.match(dni):
+            errores.append('El DNI debe contener entre 7 y 8 números.')
+        elif Persona.objects.filter(dni=dni).exists():
+            errores.append('Ya existe una persona registrada con ese DNI.')
+        if not fecha_nacimiento:
+            errores.append('La fecha de nacimiento es obligatoria.')
+        else:
+            try:
+                fecha_nacimiento = datetime.strptime(
+                    fecha_nacimiento, '%Y-%m-%d'
+                ).date()
+            except ValueError:
+                errores.append('La fecha de nacimiento no es válida.')
+        if telefono and not _TELEFONO_REGEX.match(telefono):
+            errores.append('El teléfono debe contener solo números entre 8 y 15 dígitos.')
+        if email:
+            try:
+                validate_email(email)
+            except ValidationError:
+                errores.append('Ingresá un correo electrónico válido.')
+            if Usuario.objects.filter(correo__iexact=email).exists():
+                errores.append('Ese correo ya está asociado a otro usuario.')
+        if not nombre_usuario:
+            errores.append('El nombre de usuario es obligatorio.')
+        elif Usuario.objects.filter(nombre_usuario__iexact=nombre_usuario).exists():
+            errores.append('El nombre de usuario ya existe.')
+        if not contrasenia:
+            errores.append('La contraseña provisoria es obligatoria.')
+        elif len(contrasenia) > 20:
+            errores.append('La contraseña no puede superar los 20 caracteres.')
+        if not hijos_ids:
+            errores.append('Seleccioná al menos un hijo para asociar.')
+        else:
+            alumnos = list(Alumno.objects.filter(legajo__in=hijos_ids))
+            if len(alumnos) != len(hijos_ids):
+                errores.append('Una o más asociaciones seleccionadas no son válidas.')
+
+        if errores:
+            for error in errores:
+                messages.error(request, error, extra_tags='padres-admin')
+        else:
+            with transaction.atomic():
+                usuario = Usuario.objects.create(
+                    nombre_usuario=nombre_usuario,
+                    contrasenia=make_password(contrasenia),
+                    correo=email or None,
+                    rol='padre',
+                    estado='Activo',
+                )
+                persona_tutor = Persona.objects.create(
+                    id_usuario=usuario,
+                    dni=dni,
+                    nombre=nombre,
+                    apellido=apellido,
+                    fecha_nacimiento=fecha_nacimiento,
+                    direccion=direccion or None,
+                    telefono=telefono or None,
+                    email=email or None,
+                )
+                tutor = Tutor.objects.create(
+                    id_persona=persona_tutor,
+                    telefono_contacto=telefono or None,
+                    email_contacto=email or None,
+                )
+                for alumno in alumnos:
+                    TutorTutoraAlumno.objects.create(
+                        id_tutor=tutor,
+                        id_alumno=alumno,
+                        tipo_parentesco=parentesco or None,
+                    )
+            messages.success(
+                request,
+                f'Padre/tutor {nombre} {apellido} registrado y asociado a '
+                f'{len(alumnos)} hijo(s).',
+                extra_tags='padres-admin',
+            )
+
+    request.session['panel_activo'] = 'padres-admin'
+    return redirect(reverse('dashboard-administrativo') + '?panel=padres-admin')
 
 @never_cache
 def dashboard_padres(request):
@@ -3379,7 +3935,7 @@ def dashboard_padres(request):
     def parse_fecha(c):
         try:
             return datetime.strptime(c.get("fecha", ""), '%d/%m/%Y %H:%M')
-        except:
+        except (ValueError, TypeError):
             return datetime.min
 
     if os.path.exists(COMUNICADOS_FILE):
@@ -4690,7 +5246,7 @@ def alta_alumno_admin(request):
         try:
             usuario = Usuario.objects.create(
                 nombre_usuario=nombre_usuario,
-                contrasenia=contrasenia,
+                contrasenia=make_password(contrasenia),
                 correo=email if email else None,
                 rol='alumno',
                 estado='Activo',

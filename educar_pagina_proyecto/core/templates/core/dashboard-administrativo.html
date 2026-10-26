@@ -92,6 +92,36 @@
             </a>
             <a
               href="#"
+              class="{% if panel_activo == 'reportes' %}active{% endif %}"
+              onclick="
+                showPanel('reportes', this);
+                return false;
+              "
+            >
+              <span class="nav-icon">📊</span> Reportes de alumnos
+            </a>
+            <a
+              href="#"
+              class="{% if panel_activo == 'reportes-docentes' %}active{% endif %}"
+              onclick="
+                showPanel('reportes-docentes', this);
+                return false;
+              "
+            >
+              <span class="nav-icon">👨‍🏫</span> Reportes de docentes
+            </a>
+            <a
+              href="#"
+              class="{% if panel_activo == 'reportes-avanzados' %}active{% endif %}"
+              onclick="
+                showPanel('reportes-avanzados', this);
+                return false;
+              "
+            >
+              <span class="nav-icon">🔎</span> Reportes avanzados
+            </a>
+            <a
+              href="#"
               onclick="
                 showPanel('inscripciones', this);
                 return false;
@@ -205,6 +235,13 @@
             </a>
             <a
               href="#"
+              class="{% if panel_activo == 'padres-admin' %}active{% endif %}"
+              onclick="showPanel('padres-admin', this); return false;"
+            >
+              <span class="nav-icon">👨‍👩‍👧</span> Padres y tutores
+            </a>
+            <a
+              href="#"
               onclick="
                 showPanel('perfil', this);
                 return false;
@@ -244,6 +281,215 @@
                 <div class="stat-sub">Por validar</div>
               </div>
             </div>
+          </div>
+
+          <div id="panel-reportes" class="panel {% if panel_activo == 'reportes' %}active{% endif %}">
+            <p class="section-title">📊 Reportes de alumnos</p>
+            <p style="color:#64748b; margin-top:-8px;">
+              Generá listados por curso, materia, deporte, nivel educativo,
+              recorrido de transporte o comedor.
+            </p>
+
+            <form method="get" action="{% url 'dashboard-administrativo' %}" class="form-section" style="margin:20px 0;">
+              <input type="hidden" name="panel" value="reportes">
+              <div class="form-grid">
+                <div class="form-group">
+                  <label for="reporte-tipo">Tipo de reporte</label>
+                  <select id="reporte-tipo" name="reporte_tipo" onchange="mostrarFiltroReporte()" required>
+                    <option value="">Seleccione un reporte</option>
+                    <option value="curso" {% if reporte_tipo == 'curso' %}selected{% endif %}>Curso</option>
+                    <option value="materia" {% if reporte_tipo == 'materia' %}selected{% endif %}>Materia</option>
+                    <option value="deporte" {% if reporte_tipo == 'deporte' %}selected{% endif %}>Deporte</option>
+                    <option value="nivel" {% if reporte_tipo == 'nivel' %}selected{% endif %}>Nivel educativo</option>
+                    <option value="transporte" {% if reporte_tipo == 'transporte' %}selected{% endif %}>Recorrido de transporte</option>
+                    <option value="comedor" {% if reporte_tipo == 'comedor' %}selected{% endif %}>Comedor</option>
+                  </select>
+                </div>
+
+                {% for clave, nombre in tipos_reporte.items %}
+                <div id="filtro-reporte-{{ clave }}" class="form-group filtro-reporte" style="display:none;">
+                  <label for="reporte-{{ clave }}">{{ nombre }}</label>
+                  <select id="reporte-{{ clave }}" name="reporte_{{ clave }}">
+                    <option value="">Todos</option>
+                    {% if clave == 'curso' %}
+                      {% for curso in cursos_academicos %}<option value="{{ curso.id_curso }}" {% if reporte_filtros.curso == curso.id_curso|stringformat:'s' %}selected{% endif %}>{{ curso.nivel_educativo.nombre }} {{ curso.anio }}° {{ curso.comision }} ({{ curso.turno }})</option>{% endfor %}
+                    {% elif clave == 'materia' %}
+                      {% for materia in materias_academicas %}<option value="{{ materia.id_materia }}" {% if reporte_filtros.materia == materia.id_materia|stringformat:'s' %}selected{% endif %}>{{ materia.nombre }}</option>{% endfor %}
+                    {% elif clave == 'deporte' %}
+                      {% for deporte in deportes_academicos %}<option value="{{ deporte.id_disciplina }}" {% if reporte_filtros.deporte == deporte.id_disciplina|stringformat:'s' %}selected{% endif %}>{{ deporte.nombre }}</option>{% endfor %}
+                    {% elif clave == 'nivel' %}
+                      {% for nivel in niveles_educativos %}<option value="{{ nivel.id_nivel }}" {% if reporte_filtros.nivel == nivel.id_nivel|stringformat:'s' %}selected{% endif %}>{{ nivel.nombre }}</option>{% endfor %}
+                    {% elif clave == 'transporte' %}
+                      {% for recorrido in recorridos_transporte_admin %}<option value="{{ recorrido.id_recorrido }}" {% if reporte_filtros.transporte == recorrido.id_recorrido|stringformat:'s' %}selected{% endif %}>{{ recorrido.nombre }}</option>{% endfor %}
+                    {% elif clave == 'comedor' %}
+                      <option value="{{ servicio_comedor_admin.id_servicio }}" {% if reporte_filtros.comedor == servicio_comedor_admin.id_servicio|stringformat:'s' %}selected{% endif %}>{{ servicio_comedor_admin.nombre }}</option>
+                    {% endif %}
+                  </select>
+                </div>
+                {% endfor %}
+              </div>
+              <button type="submit" class="btn-form" style="margin-top:14px;">Generar reporte</button>
+            </form>
+
+            {% if reporte_tipo %}
+            <div class="report-card" style="margin-top:20px;">
+              <h3>{{ reporte_nombre }} — {{ reportes_alumnos|length }} alumno{{ reportes_alumnos|length|pluralize }}</h3>
+              <div style="overflow-x:auto;">
+                <table class="tabla">
+                  <thead><tr><th>Alumno</th><th>DNI</th><th>Nivel</th><th>Curso</th><th>Detalle</th></tr></thead>
+                  <tbody>
+                    {% for fila in reportes_alumnos %}
+                    <tr>
+                      <td>{{ fila.alumno.id_persona.apellido }}, {{ fila.alumno.id_persona.nombre }}</td>
+                      <td>{{ fila.alumno.id_persona.dni }}</td>
+                      <td>{% if fila.alumno.id_curso %}{{ fila.alumno.id_curso.nivel_educativo.nombre }}{% else %}-{% endif %}</td>
+                      <td>{% if fila.alumno.id_curso %}{{ fila.alumno.id_curso.anio }}° {{ fila.alumno.id_curso.comision }}{% else %}Sin curso{% endif %}</td>
+                      <td>{{ fila.detalle }}</td>
+                    </tr>
+                    {% empty %}<tr><td colspan="5">No hay alumnos para el reporte seleccionado.</td></tr>{% endfor %}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+            {% endif %}
+          </div>
+
+          <div id="panel-reportes-docentes" class="panel {% if panel_activo == 'reportes-docentes' %}active{% endif %}">
+            <p class="section-title">👨‍🏫 Reportes de docentes</p>
+            <p style="color:#64748b; margin-top:-8px;">
+              Consultá la carga académica por nivel educativo, cursos, materias y horarios.
+            </p>
+
+            <form method="get" action="{% url 'dashboard-administrativo' %}" class="form-section" style="margin:20px 0;">
+              <input type="hidden" name="panel" value="reportes-docentes">
+              <div class="form-grid">
+                <div class="form-group">
+                  <label for="reporte-docente-tipo">Tipo de reporte</label>
+                  <select id="reporte-docente-tipo" name="reporte_docente_tipo" onchange="mostrarFiltroReporteDocente()" required>
+                    <option value="">Seleccione un reporte</option>
+                    <option value="nivel" {% if reporte_docente_tipo == 'nivel' %}selected{% endif %}>Por nivel educativo</option>
+                    <option value="cursos" {% if reporte_docente_tipo == 'cursos' %}selected{% endif %}>Cursos y materias a cargo</option>
+                    <option value="horarios" {% if reporte_docente_tipo == 'horarios' %}selected{% endif %}>Horarios</option>
+                  </select>
+                </div>
+                <div id="filtro-docente-nivel" class="form-group filtro-docente" style="display:none;">
+                  <label for="reporte-docente-filtro-nivel">Nivel educativo</label>
+                  <select id="reporte-docente-filtro-nivel" name="reporte_docente_filtro">
+                    <option value="">Todos</option>
+                    {% for nivel in niveles_educativos %}<option value="{{ nivel.id_nivel }}" {% if reporte_docente_filtro == nivel.id_nivel|stringformat:'s' %}selected{% endif %}>{{ nivel.nombre }}</option>{% endfor %}
+                  </select>
+                </div>
+                <div id="filtro-docente-cursos" class="form-group filtro-docente" style="display:none;">
+                  <label for="reporte-docente-filtro-curso">Curso</label>
+                  <select id="reporte-docente-filtro-curso" name="reporte_docente_filtro">
+                    <option value="">Todos</option>
+                    {% for curso in cursos_academicos %}<option value="{{ curso.id_curso }}" {% if reporte_docente_filtro == curso.id_curso|stringformat:'s' %}selected{% endif %}>{{ curso.nivel_educativo.nombre }} {{ curso.anio }}° {{ curso.comision }} ({{ curso.turno }})</option>{% endfor %}
+                  </select>
+                </div>
+                <div id="filtro-docente-horarios" class="form-group filtro-docente" style="display:none;">
+                  <label for="reporte-docente-filtro-dia">Día</label>
+                  <select id="reporte-docente-filtro-dia" name="reporte_docente_filtro">
+                    <option value="">Todos</option>
+                    <option value="lunes" {% if reporte_docente_filtro == 'lunes' %}selected{% endif %}>Lunes</option>
+                    <option value="martes" {% if reporte_docente_filtro == 'martes' %}selected{% endif %}>Martes</option>
+                    <option value="miércoles" {% if reporte_docente_filtro == 'miércoles' %}selected{% endif %}>Miércoles</option>
+                    <option value="jueves" {% if reporte_docente_filtro == 'jueves' %}selected{% endif %}>Jueves</option>
+                    <option value="viernes" {% if reporte_docente_filtro == 'viernes' %}selected{% endif %}>Viernes</option>
+                  </select>
+                </div>
+              </div>
+              <button type="submit" class="btn-form" style="margin-top:14px;">Generar reporte</button>
+            </form>
+
+            {% if reporte_docente_tipo %}
+            <div class="report-card" style="margin-top:20px;">
+              <h3>{{ reporte_docente_nombre }} — {{ reportes_docentes|length }} docente{{ reportes_docentes|length|pluralize }}</h3>
+              <div style="overflow-x:auto;">
+                <table class="tabla">
+                  <thead><tr><th>Docente</th><th>DNI</th><th>Título</th><th>Especialidad</th><th>Detalle</th></tr></thead>
+                  <tbody>
+                    {% for fila in reportes_docentes %}
+                    <tr>
+                      <td>{{ fila.docente.id_persona.apellido }}, {{ fila.docente.id_persona.nombre }}</td>
+                      <td>{{ fila.docente.id_persona.dni }}</td>
+                      <td>{{ fila.docente.titulo }}</td>
+                      <td>{{ fila.docente.especialidad|default:'-' }}</td>
+                      <td>{{ fila.detalle }}</td>
+                    </tr>
+                    {% empty %}<tr><td colspan="5">No hay docentes para el reporte seleccionado.</td></tr>{% endfor %}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+            {% endif %}
+          </div>
+
+          <div id="panel-reportes-avanzados" class="panel {% if panel_activo == 'reportes-avanzados' %}active{% endif %}">
+            <p class="section-title">🔎 Reportes avanzados</p>
+            <p style="color:#64748b; margin-top:-8px;">
+              Combiná deporte, nivel educativo, horario y profesor responsable
+              para analizar las actividades extracurriculares.
+            </p>
+
+            <form method="get" action="{% url 'dashboard-administrativo' %}" class="form-section" style="margin:20px 0;">
+              <input type="hidden" name="panel" value="reportes-avanzados">
+              <input type="hidden" name="generar_reporte_avanzado" value="1">
+              <div class="form-grid">
+                <div class="form-group">
+                  <label for="reporte-avanzado-deporte">Deporte</label>
+                  <select id="reporte-avanzado-deporte" name="reporte_avanzado_deporte">
+                    <option value="">Todos</option>
+                    {% for deporte in deportes_academicos %}<option value="{{ deporte.id_disciplina }}" {% if reporte_avanzado_filtros.deporte == deporte.id_disciplina|stringformat:'s' %}selected{% endif %}>{{ deporte.nombre }}</option>{% endfor %}
+                  </select>
+                </div>
+                <div class="form-group">
+                  <label for="reporte-avanzado-nivel">Nivel educativo</label>
+                  <select id="reporte-avanzado-nivel" name="reporte_avanzado_nivel">
+                    <option value="">Todos</option>
+                    {% for nivel in niveles_educativos %}<option value="{{ nivel.id_nivel }}" {% if reporte_avanzado_filtros.nivel == nivel.id_nivel|stringformat:'s' %}selected{% endif %}>{{ nivel.nombre }}</option>{% endfor %}
+                  </select>
+                </div>
+                <div class="form-group">
+                  <label for="reporte-avanzado-horario">Horario</label>
+                  <select id="reporte-avanzado-horario" name="reporte_avanzado_horario">
+                    <option value="">Todos</option>
+                    {% for horario in horarios_deportivos_reporte %}<option value="{{ horario.valor }}" {% if reporte_avanzado_filtros.horario == horario.valor %}selected{% endif %}>{{ horario.nombre }}</option>{% endfor %}
+                  </select>
+                </div>
+                <div class="form-group">
+                  <label for="reporte-avanzado-profesor">Profesor responsable</label>
+                  <select id="reporte-avanzado-profesor" name="reporte_avanzado_profesor">
+                    <option value="">Todos</option>
+                    {% for docente in docentes_deportivos %}<option value="{{ docente.legajo }}" {% if reporte_avanzado_filtros.profesor == docente.legajo|stringformat:'s' %}selected{% endif %}>{{ docente.id_persona.apellido }}, {{ docente.id_persona.nombre }}</option>{% endfor %}
+                  </select>
+                </div>
+              </div>
+              <button type="submit" class="btn-form" style="margin-top:14px;">Generar reporte avanzado</button>
+            </form>
+
+            {% if reporte_avanzado_generar %}
+            <div class="report-card" style="margin-top:20px;">
+              <h3>Alumnos en actividades extracurriculares — {{ reportes_avanzados|length }} resultado{{ reportes_avanzados|length|pluralize }}</h3>
+              <div style="overflow-x:auto;">
+                <table class="tabla">
+                  <thead><tr><th>Alumno</th><th>DNI</th><th>Nivel</th><th>Curso</th><th>Deporte</th><th>Horario</th><th>Profesor responsable</th></tr></thead>
+                  <tbody>
+                    {% for fila in reportes_avanzados %}
+                    <tr>
+                      <td>{{ fila.alumno.id_persona.apellido }}, {{ fila.alumno.id_persona.nombre }}</td>
+                      <td>{{ fila.alumno.id_persona.dni }}</td>
+                      <td>{{ fila.nivel }}</td>
+                      <td>{{ fila.curso }}</td>
+                      <td>{{ fila.deporte }}</td>
+                      <td>{{ fila.horario }}</td>
+                      <td>{{ fila.profesor }}</td>
+                    </tr>
+                    {% empty %}<tr><td colspan="7">No hay alumnos que coincidan con los filtros seleccionados.</td></tr>{% endfor %}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+            {% endif %}
           </div>
 
           <div id="panel-inscripciones" class="panel">
@@ -737,6 +983,71 @@
             </div>
 
             <div style="margin-top: 40px"></div>
+          </div>
+
+          <div id="panel-padres-admin" class="panel {% if panel_activo == 'padres-admin' %}active{% endif %}">
+            <p class="section-title">👨‍👩‍👧 Gestión de padres y tutores</p>
+
+            {% if messages and panel_activo == 'padres-admin' %}
+              {% for message in messages %}
+                <div class="{% if message.level_tag == 'success' %}mensaje-exito{% else %}mensaje-error{% endif %}" style="margin:12px 0;">
+                  {{ message }}
+                </div>
+              {% endfor %}
+            {% endif %}
+
+            <div class="form-section">
+              <form method="POST" action="{% url 'alta-padre-admin' %}" class="form-card">
+                {% csrf_token %}
+                <h2>Registrar padre/tutor y asociar hijos</h2>
+                <div class="form-grid">
+                  <div class="form-group"><label for="padre-nombre">Nombre</label><input id="padre-nombre" type="text" name="nombre" maxlength="50" required></div>
+                  <div class="form-group"><label for="padre-apellido">Apellido</label><input id="padre-apellido" type="text" name="apellido" maxlength="50" required></div>
+                  <div class="form-group"><label for="padre-dni">DNI</label><input id="padre-dni" type="text" name="dni" pattern="[0-9]{7,8}" maxlength="8" required></div>
+                  <div class="form-group"><label for="padre-fecha">Fecha de nacimiento</label><input id="padre-fecha" type="date" name="fecha_nacimiento" required></div>
+                  <div class="form-group"><label for="padre-direccion">Dirección</label><input id="padre-direccion" type="text" name="direccion" maxlength="100"></div>
+                  <div class="form-group"><label for="padre-telefono">Teléfono</label><input id="padre-telefono" type="tel" name="telefono" pattern="[0-9]{8,15}" maxlength="15"></div>
+                  <div class="form-group"><label for="padre-email">Correo</label><input id="padre-email" type="email" name="email" maxlength="100"></div>
+                  <div class="form-group"><label for="padre-usuario">Nombre de usuario</label><input id="padre-usuario" type="text" name="nombre_usuario" maxlength="60" required></div>
+                  <div class="form-group"><label for="padre-contrasenia">Contraseña provisoria</label><input id="padre-contrasenia" type="password" name="contrasenia" maxlength="20" required></div>
+                  <div class="form-group"><label for="padre-parentesco">Parentesco</label><input id="padre-parentesco" type="text" name="parentesco" maxlength="30" placeholder="Madre, padre, tutor..."></div>
+                </div>
+                <div class="form-group" style="margin-top:16px;">
+                  <label for="padre-hijos">Hijos asociados (Ctrl/Cmd + clic para seleccionar varios)</label>
+                  <select id="padre-hijos" name="hijos" multiple required size="6">
+                    {% for alumno in alumnos_tutores_admin %}
+                      <option value="{{ alumno.legajo }}">{{ alumno.id_persona.apellido }}, {{ alumno.id_persona.nombre }} · DNI {{ alumno.id_persona.dni }} · {% if alumno.id_curso %}{{ alumno.id_curso.nivel_educativo.nombre }} {{ alumno.id_curso.anio }}° {{ alumno.id_curso.comision }}{% else %}Sin curso{% endif %}</option>
+                    {% empty %}
+                      <option disabled>No hay alumnos disponibles para asociar.</option>
+                    {% endfor %}
+                  </select>
+                </div>
+                <button type="submit" class="btn-form">Registrar y asociar hijos</button>
+              </form>
+            </div>
+
+            <div style="margin-top:28px; overflow-x:auto;">
+              <h2>Padres/tutores registrados</h2>
+              <table class="tabla">
+                <thead><tr><th>Padre/tutor</th><th>Usuario</th><th>Contacto</th><th>Hijos asociados</th></tr></thead>
+                <tbody>
+                  {% for tutor in tutores_admin %}
+                    <tr>
+                      <td>{{ tutor.id_persona.apellido }}, {{ tutor.id_persona.nombre }}<br><small>DNI {{ tutor.id_persona.dni }}</small></td>
+                      <td>{{ tutor.id_persona.id_usuario.nombre_usuario|default:'-' }}</td>
+                      <td>{{ tutor.id_persona.email|default:'-' }}<br>{{ tutor.id_persona.telefono|default:'-' }}</td>
+                      <td>
+                        {% for relacion in tutor.hijos_admin %}
+                          <div>{{ relacion.id_alumno.id_persona.apellido }}, {{ relacion.id_alumno.id_persona.nombre }}{% if relacion.tipo_parentesco %} ({{ relacion.tipo_parentesco }}){% endif %}</div>
+                        {% empty %}-{% endfor %}
+                      </td>
+                    </tr>
+                  {% empty %}
+                    <tr><td colspan="4">No hay padres/tutores registrados.</td></tr>
+                  {% endfor %}
+                </tbody>
+              </table>
+            </div>
           </div>
 
           <!-- Panel de Niveles y Cursos -->
@@ -1937,6 +2248,13 @@
                 </tr>
               </tbody>
             </table>
+            {% if messages and panel_activo == 'perfil' %}{% for message in messages %}<div style="padding:12px 16px;border-radius:10px;margin-top:14px;{% if message.tags == 'success' %}background:#dcfce7;color:#166534;{% else %}background:#fee2e2;color:#991b1b;{% endif %}">{{ message }}</div>{% endfor %}{% endif %}
+            <form method="post" action="{% url 'actualizar-perfil' %}" style="margin-top:18px; max-width:560px;">
+              {% csrf_token %}
+              <h3>Actualizar datos de contacto</h3>
+              <div class="form-grid"><div class="form-group"><label for="perfil-telefono">Teléfono</label><input id="perfil-telefono" type="tel" name="telefono" value="{{ persona.telefono|default:'' }}" pattern="[0-9]{8,15}" maxlength="15" placeholder="Entre 8 y 15 números"></div><div class="form-group"><label for="perfil-email">Correo electrónico</label><input id="perfil-email" type="email" name="email" value="{{ persona.email|default:'' }}"></div></div>
+              <button type="submit" class="btn-form" style="margin-top:12px;">Guardar cambios</button>
+            </form>
           </div>
         </main>
       </div>
@@ -1944,6 +2262,28 @@
 
     <!-- SCRIPTS MEJORADOS PARA QUE LOS PANELES FUNCIONEN SIEMPRE -->
     <script>
+      function mostrarFiltroReporte() {
+        const tipo = document.getElementById("reporte-tipo")?.value || "";
+        document.querySelectorAll(".filtro-reporte").forEach((filtro) => {
+          filtro.style.display = filtro.id === "filtro-reporte-" + tipo ? "block" : "none";
+        });
+      }
+
+      function mostrarFiltroReporteDocente() {
+        const tipo = document.getElementById("reporte-docente-tipo")?.value || "";
+        const filtros = {
+          nivel: "filtro-docente-nivel",
+          cursos: "filtro-docente-cursos",
+          horarios: "filtro-docente-horarios",
+        };
+        document.querySelectorAll(".filtro-docente").forEach((filtro) => {
+          const activo = filtros[tipo] === filtro.id;
+          filtro.style.display = activo ? "block" : "none";
+          const selector = filtro.querySelector("select");
+          if (selector) selector.disabled = !activo;
+        });
+      }
+
       function showPanel(id, el) {
         document.querySelectorAll(".panel").forEach((p) => p.classList.remove("active"));
         document.querySelectorAll(".sidebar-nav a").forEach((a) => a.classList.remove("active"));
@@ -1952,6 +2292,7 @@
         if (targetPanel) {
             targetPanel.classList.add("active");
         }
+        window.scrollTo({ top: 0, behavior: "smooth" });
         if (el) {
             el.classList.add("active");
         }
@@ -1967,6 +2308,8 @@
       }
 
       document.addEventListener("DOMContentLoaded", function () {
+        mostrarFiltroReporte();
+        mostrarFiltroReporteDocente();
         const panel = "{{ panel_activo }}";
         if (!panel || panel === "inicio") return;
 

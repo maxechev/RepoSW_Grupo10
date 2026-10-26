@@ -1,0 +1,94 @@
+### version information
+
+```
+pre-commit version: 4.7.0
+git --version: git version 2.52.0.windows.1
+sys.version:
+    3.13.3 (tags/v3.13.3:6280bb5, Apr  8 2025, 14:47:33) [MSC v.1943 64 bit (AMD64)]
+sys.executable: C:\Users\Joel\Downloads\metodo\venv\Scripts\python.exe
+os.name: nt
+sys.platform: win32
+```
+
+### error information
+
+```
+An unexpected error has occurred: PermissionError: [WinError 5] Acceso denegado: 'C:\\Users\\Joel\\Downloads\\metodo\\.pre-commit-cache\\repo36cmka1l'
+```
+
+```
+Traceback (most recent call last):
+  File "C:\Users\Joel\Downloads\metodo\venv\Lib\site-packages\pre_commit\util.py", line 31, in clean_path_on_failure
+    yield
+  File "C:\Users\Joel\Downloads\metodo\venv\Lib\site-packages\pre_commit\store.py", line 164, in _new_repo
+    make_strategy(directory)
+    ~~~~~~~~~~~~~^^^^^^^^^^^
+  File "C:\Users\Joel\Downloads\metodo\venv\Lib\site-packages\pre_commit\store.py", line 55, in _make_local_repo
+    with open(target_file, 'w') as f:
+         ~~~~^^^^^^^^^^^^^^^^^^
+PermissionError: [Errno 13] Permission denied: 'C:\\Users\\Joel\\Downloads\\metodo\\.pre-commit-cache\\repo36cmka1l\\Cargo.toml'
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "C:\Users\Joel\Downloads\metodo\venv\Lib\site-packages\pre_commit\error_handler.py", line 73, in error_handler
+    yield
+  File "C:\Users\Joel\Downloads\metodo\venv\Lib\site-packages\pre_commit\main.py", line 429, in main
+    return run(args.config, store, args)
+  File "C:\Users\Joel\Downloads\metodo\venv\Lib\site-packages\pre_commit\commands\run.py", line 426, in run
+    for hook in all_hooks(config, store)
+                ~~~~~~~~~^^^^^^^^^^^^^^^
+  File "C:\Users\Joel\Downloads\metodo\venv\Lib\site-packages\pre_commit\repository.py", line 233, in all_hooks
+    return tuple(
+        hook
+        for repo in root_config['repos']
+        for hook in _repository_hooks(repo, store, root_config)
+    )
+  File "C:\Users\Joel\Downloads\metodo\venv\Lib\site-packages\pre_commit\repository.py", line 236, in <genexpr>
+    for hook in _repository_hooks(repo, store, root_config)
+                ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Joel\Downloads\metodo\venv\Lib\site-packages\pre_commit\repository.py", line 209, in _repository_hooks
+    return _non_cloned_repository_hooks(repo_config, store, root_config)
+  File "C:\Users\Joel\Downloads\metodo\venv\Lib\site-packages\pre_commit\repository.py", line 161, in _non_cloned_repository_hooks
+    return tuple(
+        Hook.create(
+    ...<4 lines>...
+        for hook in repo_config['hooks']
+    )
+  File "C:\Users\Joel\Downloads\metodo\venv\Lib\site-packages\pre_commit\repository.py", line 164, in <genexpr>
+    _prefix(hook['language'], hook['additional_dependencies']),
+    ~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Joel\Downloads\metodo\venv\Lib\site-packages\pre_commit\repository.py", line 159, in _prefix
+    return Prefix(store.make_local(deps))
+                  ~~~~~~~~~~~~~~~~^^^^^^
+  File "C:\Users\Joel\Downloads\metodo\venv\Lib\site-packages\pre_commit\store.py", line 213, in make_local
+    return self._new_repo(
+           ~~~~~~~~~~~~~~^
+        'local', C.LOCAL_REPO_VERSION, deps, _make_local_repo,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "C:\Users\Joel\Downloads\metodo\venv\Lib\site-packages\pre_commit\store.py", line 163, in _new_repo
+    with clean_path_on_failure(directory):
+         ~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^
+  File "C:\Users\Joel\AppData\Local\Programs\Python\Python313\Lib\contextlib.py", line 162, in __exit__
+    self.gen.throw(value)
+    ~~~~~~~~~~~~~~^^^^^^^
+  File "C:\Users\Joel\Downloads\metodo\venv\Lib\site-packages\pre_commit\util.py", line 34, in clean_path_on_failure
+    rmtree(path)
+    ~~~~~~^^^^^^
+  File "C:\Users\Joel\Downloads\metodo\venv\Lib\site-packages\pre_commit\util.py", line 235, in rmtree
+    shutil.rmtree(path, ignore_errors=False, onexc=_handle_readonly)
+    ~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Joel\AppData\Local\Programs\Python\Python313\Lib\shutil.py", line 790, in rmtree
+    return _rmtree_unsafe(path, onexc)
+  File "C:\Users\Joel\AppData\Local\Programs\Python\Python313\Lib\shutil.py", line 613, in _rmtree_unsafe
+    for dirpath, dirnames, filenames in results:
+                                        ^^^^^^^
+  File "<frozen os>", line 371, in walk
+  File "C:\Users\Joel\AppData\Local\Programs\Python\Python313\Lib\shutil.py", line 611, in onerror
+    onexc(os.scandir, err.filename, err)
+    ~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "<frozen os>", line 368, in walk
+PermissionError: [WinError 5] Acceso denegado: 'C:\\Users\\Joel\\Downloads\\metodo\\.pre-commit-cache\\repo36cmka1l'
+```
