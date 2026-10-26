@@ -56,10 +56,4 @@ GitHub Actions conserva la duración e historial de cada ejecución. La tendenci
 
 ## SonarQube Cloud
 
-El workflow `.github/workflows/sonarcloud.yml` queda preparado para analizar el repositorio. Para activarlo, importar el repositorio en SonarQube Cloud y crear en GitHub Actions:
-
-- Secreto `SONAR_TOKEN` con el token creado por el equipo.
-- Variable `SONAR_ORGANIZATION` con la clave de la organización.
-- Variable `SONAR_PROJECT_KEY` con la clave del proyecto.
-
-Los nombres/valores se obtienen desde la cuenta del equipo. Nunca guardar el token en el repositorio. Hasta vincular el proyecto y completar estos valores, SonarCloud no generará análisis.
+SonarQube Cloud analiza los Pull Requests mediante la integración conectada con GitHub. El archivo sonar-project.properties define las rutas y exclusiones del análisis. No guardes tokens en el repositorio.
