@@ -1,10 +1,13 @@
+from decimal import Decimal, InvalidOperation
 import requests
 import json
 import os
 from urllib.parse import urlencode
-from django.http import JsonResponse
+from django.http import FileResponse, Http404, JsonResponse
+from django.views.decorators.http import require_POST
 import re
 from django.core.files.storage import FileSystemStorage
+from django.core import signing
 from datetime import datetime, date, time
 from django.conf import settings
 from datetime import date
@@ -56,6 +59,8 @@ from .models import (
     PostulacionLaboral,
     SolicitudInscripcion,
     PagoPendiente,
+    PagoCuota,
+    ComprobantePago,
     Arancel,
     DocumentacionAlumno,
     Tarea,
@@ -95,7 +100,10 @@ def obtener_persona(request):
     if not usuario_id:
         return None
 
-    usuario = Usuario.objects.get(id=usuario_id)
+    usuario = Usuario.objects.filter(id=usuario_id).first()
+    if not usuario or getattr(usuario, 'estado', 'Activo') != 'Activo':
+        request.session.flush()
+        return None
     return Persona.objects.filter(id_usuario=usuario).first()
 
 
@@ -212,6 +220,276 @@ def _admin_session(request):
     return persona
 
 
+MESES_PERIODO_CUOTA = (
+    'Enero', 'Febrero', 'Marzo', 'Abril', 'Mayo', 'Junio',
+    'Julio', 'Agosto', 'Septiembre', 'Octubre', 'Noviembre', 'Diciembre',
+)
+
+NIVELES_EQUIVALENTES_ARANCEL = {
+    'inicial': 'inicial',
+    'primaria': 'primario',
+    'primario': 'primario',
+    'secundaria': 'secundario',
+    'secundario': 'secundario',
+}
+
+
+def _clave_nivel_arancel(nombre):
+    nombre_normalizado = ' '.join((nombre or '').strip().casefold().split())
+    return NIVELES_EQUIVALENTES_ARANCEL.get(nombre_normalizado, nombre_normalizado)
+
+
+def _plan_generacion_cuotas(periodo):
+    """Prepara cuotas para alumnos activos sin escribir en la base."""
+    alumnos = Alumno.objects.filter(estado='Activo').select_related(
+        'id_persona', 'id_curso__nivel_educativo'
+    ).order_by('id_persona__apellido', 'id_persona__nombre')
+    alumno_ids = list(alumnos.values_list('legajo', flat=True))
+
+    tutores_por_alumno = {}
+    relaciones = TutorTutoraAlumno.objects.filter(
+        id_alumno_id__in=alumno_ids
+    ).values_list('id_alumno_id', 'id_tutor_id')
+    for alumno_id, tutor_id in relaciones:
+        tutores_por_alumno.setdefault(alumno_id, set()).add(tutor_id)
+
+    tutores = Tutor.objects.select_related(
+        'id_persona__id_usuario'
+    ).in_bulk({
+        tutor_id
+        for tutor_ids in tutores_por_alumno.values()
+        for tutor_id in tutor_ids
+    })
+
+    aranceles_por_nivel = {}
+    for arancel in Arancel.objects.all().order_by('id_arancel'):
+        clave_nivel = _clave_nivel_arancel(arancel.nivel)
+        aranceles_por_nivel.setdefault(clave_nivel, []).append(arancel)
+
+    cuotas_existentes = set(Cuota.objects.filter(
+        periodo=periodo
+    ).values_list('id_legajo_alumno_id', flat=True))
+
+    plan = {'periodo': periodo, 'crear': [], 'omitidos': []}
+    for alumno in alumnos:
+        nombre_alumno = f'{alumno.id_persona.nombre} {alumno.id_persona.apellido}'
+        omitido = None
+
+        if not alumno.id_curso_id:
+            omitido = 'El alumno no tiene un curso asignado.'
+        elif alumno.id_curso.nivel_educativo.estado != 'Activo':
+            omitido = 'El nivel educativo está inactivo.'
+
+        tutor_ids = tutores_por_alumno.get(alumno.legajo, set())
+        if omitido is None and not tutor_ids:
+            omitido = 'El alumno no tiene un tutor asociado.'
+        elif omitido is None and len(tutor_ids) > 1:
+            omitido = 'Tiene más de un tutor asociado; falta definir el tutor de facturación.'
+
+        tutor = None
+        if omitido is None:
+            tutor = tutores.get(next(iter(tutor_ids)))
+            if not tutor or not tutor.id_persona_id or not tutor.id_persona.id_usuario_id:
+                omitido = 'El tutor no tiene una cuenta vinculada para acceder a la app.'
+            elif tutor.id_persona.id_usuario.estado != 'Activo':
+                omitido = 'La cuenta del tutor está inactiva.'
+
+        aranceles = []
+        if omitido is None:
+            nivel = alumno.id_curso.nivel_educativo.nombre
+            aranceles = aranceles_por_nivel.get(_clave_nivel_arancel(nivel), [])
+            if len(aranceles) == 0:
+                omitido = f'No hay arancel configurado para {nivel}.'
+            elif len(aranceles) > 1:
+                omitido = f'Hay más de un arancel configurado para {nivel}.'
+
+        if omitido is None and alumno.legajo in cuotas_existentes:
+            omitido = 'Ya existe una cuota de este período para el alumno.'
+
+        if omitido:
+            plan['omitidos'].append({
+                'alumno': nombre_alumno,
+                'legajo': alumno.legajo,
+                'motivo': omitido,
+            })
+            continue
+
+        plan['crear'].append({
+            'alumno': alumno,
+            'tutor': tutor,
+            'monto': aranceles[0].monto,
+            'nivel': alumno.id_curso.nivel_educativo.nombre,
+        })
+
+    return plan
+
+
+def _obtener_cuotas_con_saldo():
+    abiertas = []
+    for cuota in Cuota.objects.select_related(
+        'id_tutor__id_persona',
+        'id_legajo_alumno__id_persona',
+    ).prefetch_related('pagos').order_by('-fecha_vencimiento', '-id_cuota'):
+        pagado = sum(
+            pago.importe
+            for pago in cuota.pagos.all()
+            if pago.estado == 'Pagado'
+        )
+        saldo = max((cuota.total_obligacion or 0) - pagado, 0)
+        if saldo <= 0:
+            continue
+
+        cuota.monto_pagado_panel = pagado
+        cuota.saldo_panel = saldo
+        cuota.estado_panel = cuota.estado or 'Pendiente'
+        if (
+            cuota.estado_panel not in {'Pagada', 'Parcial'}
+            and cuota.fecha_vencimiento
+            and cuota.fecha_vencimiento < timezone.localdate()
+        ):
+            cuota.estado_panel = 'Vencida'
+        abiertas.append(cuota)
+    return abiertas
+
+
+def _pagos_admin(request):
+    """Historial completo; el filtro solo cambia la vista, nunca borra datos."""
+    estados = {'Pendiente', 'En revisión', 'Pagado', 'Rechazado'}
+    estado = (request.GET.get('pago_estado') or '').strip()
+    pagos = PagoPendiente.objects.select_related(
+        'id_tutor__id_persona', 'legajo_alumno__id_persona'
+    ).prefetch_related('pago_aplicado__comprobantes').order_by('-fecha_solicitud', '-id_pago')
+    if estado in estados:
+        pagos = pagos.filter(estado=estado)
+    return pagos
+
+
+def _datos_plan_cuotas(plan, fecha_vencimiento):
+    cuotas = sorted(
+        [
+            fila['alumno'].legajo,
+            fila['tutor'].id,
+            str(fila['monto']),
+        ]
+        for fila in plan['crear']
+    )
+    return {
+        'periodo': plan['periodo'],
+        'fecha_vencimiento': fecha_vencimiento.isoformat(),
+        'cuotas': cuotas,
+    }
+
+
+def _render_previsualizacion_cuotas(request, periodo, fecha_vencimiento):
+    fecha_periodo = datetime.strptime(periodo, '%Y-%m').date()
+    periodo_label = f'{MESES_PERIODO_CUOTA[fecha_periodo.month - 1]} {fecha_periodo.year}'
+    plan = _plan_generacion_cuotas(periodo_label)
+    revision = signing.dumps(
+        _datos_plan_cuotas(plan, fecha_vencimiento),
+        salt='generar-cuotas-administrativo',
+    )
+    return render(request, 'core/confirmar-generacion-cuotas.html', {
+        'plan': plan,
+        'fecha_vencimiento': fecha_vencimiento,
+        'periodo_form': periodo,
+        'vencimiento_form': fecha_vencimiento.isoformat(),
+        'revision_plan': revision,
+        'mensajes': list(get_messages(request)),
+    })
+
+
+@never_cache
+@require_POST
+def generar_cuotas_administrativo(request):
+    if not _admin_session(request):
+        return redirect('login')
+
+    periodo_form = (request.POST.get('periodo') or '').strip()
+    vencimiento_form = (request.POST.get('fecha_vencimiento') or '').strip()
+    try:
+        fecha_periodo = datetime.strptime(periodo_form, '%Y-%m').date()
+        fecha_vencimiento = date.fromisoformat(vencimiento_form)
+        periodo = f'{MESES_PERIODO_CUOTA[fecha_periodo.month - 1]} {fecha_periodo.year}'
+        if (fecha_vencimiento.year, fecha_vencimiento.month) != (
+            fecha_periodo.year, fecha_periodo.month
+        ):
+            raise ValueError
+    except (TypeError, ValueError):
+        messages.error(
+            request,
+            'Elegí un período válido y una fecha de vencimiento dentro de ese mismo mes.',
+        )
+        return redirect(f"{reverse('dashboard-administrativo')}?panel=pagos")
+
+    if request.POST.get('accion') != 'confirmar':
+        return _render_previsualizacion_cuotas(
+            request, periodo_form, fecha_vencimiento
+        )
+
+    if request.POST.get('confirmar') != 'si':
+        messages.error(request, 'Marcá la confirmación para generar las cuotas revisadas.')
+        return redirect(f"{reverse('dashboard-administrativo')}?panel=pagos")
+
+    with transaction.atomic():
+        plan = _plan_generacion_cuotas(periodo)
+        try:
+            revision_previa = signing.loads(
+                request.POST.get('revision_plan', ''),
+                salt='generar-cuotas-administrativo',
+                max_age=900,
+            )
+        except signing.BadSignature:
+            messages.error(
+                request,
+                'La previsualización venció o no es válida. Revisá nuevamente las cuotas.',
+            )
+            return redirect(f"{reverse('dashboard-administrativo')}?panel=pagos")
+
+        if revision_previa != _datos_plan_cuotas(plan, fecha_vencimiento):
+            messages.warning(
+                request,
+                'Los alumnos, aranceles o vencimientos cambiaron desde la previsualización. '
+                'Revisá la lista actualizada antes de confirmar.',
+            )
+            return _render_previsualizacion_cuotas(
+                request, periodo_form, fecha_vencimiento
+            )
+
+        if not plan['crear']:
+            messages.warning(
+                request,
+                'No se generaron cuotas: no hay alumnos elegibles nuevos para ese período.',
+            )
+            return redirect(f"{reverse('dashboard-administrativo')}?panel=pagos")
+
+        for fila in plan['crear']:
+            Cuota.objects.create(
+                periodo=periodo,
+                monto=fila['monto'],
+                monto_total=fila['monto'],
+                fecha_vencimiento=fecha_vencimiento,
+                fecha_pago=None,
+                medio_pago=None,
+                estado='Pendiente',
+                id_tutor=fila['tutor'],
+                id_legajo_alumno=fila['alumno'],
+            )
+
+    messages.success(
+        request,
+        f"Se generaron {len(plan['crear'])} cuotas pendientes para {periodo}. "
+        'No se registraron pagos.',
+    )
+    return redirect(f"{reverse('dashboard-administrativo')}?panel=pagos")
+
+
+def _tutor_session(request):
+    persona = obtener_persona(request)
+    if not persona:
+        return None
+    return Tutor.objects.filter(id_persona=persona).first()
+
+
 def _active_comedor():
     # El comedor es un servicio único. Puede estar inactivo, pero no debe
     # crearse otro registro con el mismo nombre al cargar el panel admin.
@@ -219,6 +497,18 @@ def _active_comedor():
     if servicio:
         return servicio
     return ServicioComedor.objects.create(nombre='Comedor escolar', cupo_maximo=100, estado='Activo')
+
+
+def _parse_monto_servicio(valor):
+    try:
+        monto = Decimal(str(valor).strip())
+    except (InvalidOperation, AttributeError):
+        raise ValueError('Ingresá un arancel mensual válido.')
+    if not monto.is_finite() or monto < 0:
+        raise ValueError('El arancel mensual no puede ser negativo.')
+    if monto > Decimal('99999999.99'):
+        raise ValueError('El arancel mensual supera el máximo permitido.')
+    return monto.quantize(Decimal('0.01'))
 
 
 @never_cache
@@ -231,13 +521,20 @@ def alta_recorrido_admin(request):
             cupo = int(request.POST.get('cupo_maximo') or 0)
         except ValueError:
             cupo = 0
-        if not nombre or cupo < 1:
-            messages.error(request, 'Ingresá un nombre y un cupo válido.')
+        try:
+            monto_mensual = _parse_monto_servicio(request.POST.get('monto_mensual') or '10000')
+        except ValueError as exc:
+            monto_mensual = None
+            messages.error(request, str(exc))
+        if not nombre or cupo < 1 or monto_mensual is None:
+            if not nombre or cupo < 1:
+                messages.error(request, 'Ingresá un nombre y un cupo válido.')
         elif RecorridoTransporte.objects.filter(nombre__iexact=nombre).exists():
             messages.error(request, 'Ya existe un recorrido con ese nombre.')
         else:
             RecorridoTransporte.objects.create(
                 nombre=nombre,
+                monto_mensual=monto_mensual,
                 descripcion=(request.POST.get('descripcion') or '').strip(),
                 turno=request.POST.get('turno') or 'Mañana',
                 hora_salida=request.POST.get('hora_salida') or None,
@@ -263,8 +560,11 @@ def modificar_recorrido_admin(request, id_recorrido):
         recorrido.hora_salida = request.POST.get('hora_salida') or None
         try:
             recorrido.cupo_maximo = max(1, int(request.POST.get('cupo_maximo') or recorrido.cupo_maximo))
-        except ValueError:
-            messages.error(request, 'El cupo debe ser numérico.')
+            recorrido.monto_mensual = _parse_monto_servicio(
+                request.POST.get('monto_mensual') or recorrido.monto_mensual
+            )
+        except (ValueError, InvalidOperation) as exc:
+            messages.error(request, str(exc) or 'El cupo debe ser numérico.')
         else:
             recorrido.estado = request.POST.get('estado') or recorrido.estado
             recorrido.save()
@@ -319,12 +619,17 @@ def modificar_comedor_admin(request):
     if request.method == 'POST':
         cupo_anterior = servicio.cupo_maximo
         estado_anterior = servicio.estado
+        monto_anterior = servicio.monto_mensual
         try:
             nuevo_cupo = max(1, int(request.POST.get('cupo_maximo') or servicio.cupo_maximo))
             nuevo_estado = request.POST.get('estado') or servicio.estado
+            nuevo_monto = _parse_monto_servicio(
+                request.POST.get('monto_mensual') or servicio.monto_mensual
+            )
             servicio.cupo_maximo = nuevo_cupo
             servicio.estado = nuevo_estado
-            servicio.save(update_fields=['cupo_maximo', 'estado'])
+            servicio.monto_mensual = nuevo_monto
+            servicio.save(update_fields=['cupo_maximo', 'estado', 'monto_mensual'])
             cambios = []
             if cupo_anterior != nuevo_cupo:
                 cambios.append('cupo')
@@ -338,6 +643,8 @@ def modificar_comedor_admin(request):
                 messages.success(request, f'El comedor fue {estado_texto} correctamente.')
             elif cupo_anterior != nuevo_cupo:
                 messages.success(request, 'El cupo del comedor fue actualizado correctamente.')
+            elif monto_anterior != nuevo_monto:
+                messages.success(request, 'El arancel mensual del comedor fue actualizado correctamente.')
             else:
                 messages.info(request, 'No hubo cambios en el comedor.')
         except ValueError:
@@ -700,6 +1007,9 @@ def login(request):
                     'error': 'El tipo de usuario seleccionado no corresponde a esta cuenta.'
                 })
 
+            # Eliminar cualquier estado anónimo previo y rotar la clave de
+            # sesión evita reutilizar una sesión controlada antes del login.
+            request.session.flush()
             request.session['usuario_id'] = usuario.id
             # Cada nuevo inicio de sesión comienza en Inicio. El panel se
             # conserva solamente durante la sesión activa para las recargas.
@@ -1995,14 +2305,8 @@ def dashboard_administrativo(request):
     else:
         opiniones = []
     
-    cuotas = Cuota.objects.select_related(
-        'id_tutor__id_persona',
-        'id_legajo_alumno__id_persona'
-    )
-    
-    cuotas_pendientes = PagoPendiente.objects.exclude(
-        estado='Pagada'
-    ).count()
+    cuotas_abiertas = _obtener_cuotas_con_saldo()
+    cuotas_pendientes = len(cuotas_abiertas)
 
     solicitudes = SolicitudInscripcion.objects.all().order_by('-fecha_solicitud')
 
@@ -2010,7 +2314,7 @@ def dashboard_administrativo(request):
         estado="Pendiente"
     ).count()
     
-    pagos_pendientes = PagoPendiente.objects.all()
+    pagos_pendientes = _pagos_admin(request)
     documentacion_pendiente = DocumentacionAlumno.objects.filter(
         estado='Pendiente'
     ).count()
@@ -2475,6 +2779,7 @@ def dashboard_administrativo(request):
         panel_activo = panel_solicitado
         request.session['panel_activo'] = panel_activo
     mensajes = list(get_messages(request))
+    periodo_cuota_sugerido = timezone.localdate().strftime('%Y-%m')
     
     return render(request, 'core/dashboard-administrativo.html', {
         'persona': persona,
@@ -2482,8 +2787,9 @@ def dashboard_administrativo(request):
         'instalaciones': instalaciones,
         'reservas': reservas,
         'opiniones': opiniones,
-        'cuotas': cuotas,
+        'cuotas_abiertas': cuotas_abiertas,
         'cuotas_pendientes': cuotas_pendientes,
+        'periodo_cuota_sugerido': periodo_cuota_sugerido,
         'solicitudes': solicitudes,
         'inscripciones_pendientes': inscripciones_pendientes,
         'pagos_pendientes': pagos_pendientes,
@@ -2826,13 +3132,19 @@ def alta_deporte_admin(request):
     if request.method == 'POST':
         nombre = (request.POST.get('nombre') or '').strip()
         instalacion_id = request.POST.get('id_instalacion')
-        if not nombre or not instalacion_id:
-            messages.error(request, 'El nombre y la instalación son obligatorios.')
+        try:
+            monto_mensual = _parse_monto_servicio(request.POST.get('monto_mensual') or '5000')
+        except ValueError as exc:
+            monto_mensual = None
+            messages.error(request, str(exc))
+        if not nombre or not instalacion_id or monto_mensual is None:
+            if not nombre or not instalacion_id:
+                messages.error(request, 'El nombre y la instalación son obligatorios.')
         elif DisciplinaDeportiva.objects.filter(nombre__iexact=nombre).exists():
             messages.error(request, 'Ya existe ese deporte.')
         else:
             instalacion = get_object_or_404(Instalacion, id=instalacion_id)
-            DisciplinaDeportiva.objects.create(nombre=nombre, id_instalacion=instalacion)
+            DisciplinaDeportiva.objects.create(nombre=nombre, id_instalacion=instalacion, monto_mensual=monto_mensual)
             messages.success(request, 'Deporte creado correctamente.')
     return redirect('lista-deportes-admin')
 
@@ -2845,14 +3157,23 @@ def modificar_deporte_admin(request, id_disciplina):
     if request.method == 'POST':
         nombre = (request.POST.get('nombre') or '').strip()
         instalacion_id = request.POST.get('id_instalacion')
-        if not nombre or not instalacion_id:
-            messages.error(request, 'El nombre y la instalación son obligatorios.')
+        try:
+            monto_mensual = _parse_monto_servicio(
+                request.POST.get('monto_mensual') or deporte.monto_mensual
+            )
+        except ValueError as exc:
+            monto_mensual = None
+            messages.error(request, str(exc))
+        if not nombre or not instalacion_id or monto_mensual is None:
+            if not nombre or not instalacion_id:
+                messages.error(request, 'El nombre y la instalación son obligatorios.')
         elif DisciplinaDeportiva.objects.filter(nombre__iexact=nombre).exclude(id_disciplina=id_disciplina).exists():
             messages.error(request, 'Ya existe otro deporte con ese nombre.')
         else:
             deporte.nombre = nombre
             deporte.id_instalacion_id = instalacion_id
-            deporte.save(update_fields=['nombre', 'id_instalacion'])
+            deporte.monto_mensual = monto_mensual
+            deporte.save(update_fields=['nombre', 'id_instalacion', 'monto_mensual'])
             messages.success(request, 'Deporte actualizado correctamente.')
     return redirect('lista-deportes-admin')
 
@@ -3094,10 +3415,11 @@ def lista_profesores_admin(request):
     else:
         opiniones = []
     
-    cuotas_pendientes = PagoPendiente.objects.exclude(estado='Pagada').count()
+    cuotas_abiertas = _obtener_cuotas_con_saldo()
+    cuotas_pendientes = len(cuotas_abiertas)
     solicitudes = SolicitudInscripcion.objects.all().order_by('-fecha_solicitud')
     inscripciones_pendientes = SolicitudInscripcion.objects.filter(estado="Pendiente").count()
-    pagos_pendientes = PagoPendiente.objects.all()
+    pagos_pendientes = _pagos_admin(request)
     documentacion_pendiente = DocumentacionAlumno.objects.filter(estado='Pendiente').count()
     documentaciones = DocumentacionAlumno.objects.filter(estado='Pendiente').order_by('-fecha_envio')
     
@@ -3156,6 +3478,8 @@ def lista_profesores_admin(request):
         'reservas': reservas,
         'opiniones': opiniones,
         'cuotas_pendientes': cuotas_pendientes,
+        'cuotas_abiertas': cuotas_abiertas,
+        'periodo_cuota_sugerido': timezone.localdate().strftime('%Y-%m'),
         'solicitudes': solicitudes,
         'inscripciones_pendientes': inscripciones_pendientes,
         'pagos_pendientes': pagos_pendientes,
@@ -3369,7 +3693,10 @@ def baja_profesor_admin(request, legajo):
     return redirect('lista-profesores-admin')
 
 @never_cache
+@require_POST
 def aprobar_inscripcion(request, id_solicitud):
+    if not _admin_session(request):
+        return redirect('login')
 
     solicitud = SolicitudInscripcion.objects.get(
         id_solicitud=id_solicitud
@@ -3466,7 +3793,10 @@ def aprobar_inscripcion(request, id_solicitud):
     return redirect('dashboard-administrativo')
 
 @never_cache
+@require_POST
 def rechazar_inscripcion(request, id_solicitud):
+    if not _admin_session(request):
+        return redirect('login')
 
     solicitud = get_object_or_404(
         SolicitudInscripcion,
@@ -3478,8 +3808,10 @@ def rechazar_inscripcion(request, id_solicitud):
     return redirect('dashboard-administrativo')
 
 @never_cache
+@require_POST
 def crear_reserva(request):
-    print(request.POST)
+    if not _admin_session(request):
+        return redirect('login')
 
     if request.method == "POST":
 
@@ -3578,7 +3910,10 @@ def crear_reserva(request):
         return redirect(reverse('dashboard-administrativo') + '#reservas')
 
 @never_cache
+@require_POST
 def eliminar_opinion(request, indice):
+    if not _admin_session(request):
+        return redirect('login')
 
     if request.method == "POST":
 
@@ -3689,6 +4024,7 @@ def modificar_usuario_admin(request, id_usuario):
 
 
 @never_cache
+@require_POST
 def baja_usuario_admin(request, id_usuario):
     persona_sesion, dashboard_url = obtener_datos_sesion(request)
     if not persona_sesion or dashboard_url != 'dashboard-administrativo':
@@ -4228,7 +4564,11 @@ def dashboard_preceptor(request):
         context
     )
 
+@require_POST
 def crear_noticia(request):
+
+    if not _admin_session(request):
+        return redirect('login')
 
     if request.method == 'POST':
 
@@ -4330,6 +4670,9 @@ def obtener_datos_sesion(request):
         return None, None
     try:
         usuario = Usuario.objects.get(id=usuario_id)
+        if getattr(usuario, 'estado', 'Activo') != 'Activo':
+            request.session.flush()
+            return None, None
         persona = Persona.objects.filter(id_usuario=usuario).first()
         if not persona:
             return None, None
@@ -4354,9 +4697,7 @@ def obtener_datos_sesion(request):
         return None, None
 
 def logout(request):
-    if 'usuario_id' in request.session:
-        del request.session['usuario_id']
-    request.session.pop('panel_activo', None)
+    request.session.flush()
     return redirect('index')
 
 def crear_comunicado(request):
@@ -4369,6 +4710,9 @@ def crear_comunicado(request):
 
         persona = obtener_persona(request)
 
+        if not persona:
+            return redirect('login')
+
         rol = "Desconocido"
 
         if Directivo.objects.filter(id_persona=persona.id).exists():
@@ -4379,6 +4723,9 @@ def crear_comunicado(request):
             rol = "Preceptor"
         elif PersonalAdministrativo.objects.filter(id_persona=persona.id).exists():
             rol = "Administrativo"
+
+        if rol == "Desconocido":
+            return redirect('login')
 
         if not titulo or not contenido_form:
             return redirect('dashboard-directivo')
@@ -4443,6 +4790,7 @@ def crear_comunicado(request):
             return redirect('dashboard-directivo')
         
 @never_cache
+@require_POST
 def registrar_pago(request):
 
     persona = obtener_persona(request)
@@ -4450,16 +4798,17 @@ def registrar_pago(request):
     if not persona:
         return redirect('login')
 
-    tutor = Tutor.objects.filter(
-        id_persona=persona
-    ).first()
+    tutor = Tutor.objects.filter(id_persona=persona).first()
+    if not tutor:
+        return redirect('login')
 
     if request.method == 'POST':
 
         try:
 
             alumno = Alumno.objects.get(
-                legajo=request.POST.get('alumno')
+                legajo=request.POST.get('alumno'),
+                tutortutoraalumno__id_tutor=tutor,
             )
 
             curso = alumno.id_curso
@@ -4473,7 +4822,7 @@ def registrar_pago(request):
             if PagoPendiente.objects.filter(
                 legajo_alumno=alumno,
                 mes=request.POST.get('mes'),
-                estado='Pendiente'
+                estado__in=['Pendiente', 'En revisión']
             ).exists():
 
                 messages.error(
@@ -4544,39 +4893,113 @@ def registrar_pago(request):
     return redirect('dashboard-padres')
 
 @never_cache
+@require_POST
 def aprobar_pago(request, id_pago):
+    if not _admin_session(request):
+        return redirect('login')
 
-    pago = PagoPendiente.objects.get(
-        id_pago=id_pago
-    )
+    with transaction.atomic():
+        pago = PagoPendiente.objects.select_for_update().get(id_pago=id_pago)
+        if pago.estado == 'Pagado':
+            return redirect('dashboard-administrativo')
+        if pago.estado == 'Rechazado':
+            messages.error(request, 'No se puede aprobar un pago rechazado.')
+            return redirect('dashboard-administrativo')
 
-    Cuota.objects.create(
-        periodo=pago.mes,
-        monto=pago.importe,
-        fecha_pago=date.today(),
-        medio_pago='Transferencia',
-        estado='Pagada',
-        id_tutor=pago.id_tutor,
-        id_legajo_alumno=pago.legajo_alumno
-    )
-
-    pago.delete()
+        cuota = Cuota.objects.select_for_update().filter(
+            id_tutor=pago.id_tutor,
+            id_legajo_alumno=pago.legajo_alumno,
+            periodo=pago.mes,
+        ).order_by('-id_cuota').first()
+        if cuota is None:
+            cuota = Cuota.objects.create(
+                periodo=pago.mes,
+                monto=pago.importe,
+                monto_total=pago.importe,
+                fecha_pago=date.today(),
+                medio_pago='Transferencia',
+                estado='Pendiente',
+                id_tutor=pago.id_tutor,
+                id_legajo_alumno=pago.legajo_alumno,
+            )
+        try:
+            pago_aplicado = pago.pago_aplicado
+        except PagoCuota.DoesNotExist:
+            pago_aplicado = None
+        if pago_aplicado is None:
+            pago_aplicado = PagoCuota.objects.create(
+                cuota=cuota,
+                solicitud=pago,
+                tutor=pago.id_tutor,
+                importe=pago.importe,
+                fecha_pago=date.today(),
+                medio_pago='Transferencia',
+                estado='Pagado',
+            )
+        elif pago_aplicado.estado != 'Pagado':
+            pago_aplicado.estado = 'Pagado'
+            pago_aplicado.fecha_pago = date.today()
+            pago_aplicado.save(update_fields=['estado', 'fecha_pago'])
+        ComprobantePago.objects.filter(pago=pago_aplicado).update(estado='Aprobado')
+        pago.estado = 'Pagado'
+        pago.save(update_fields=['estado'])
+        cuota.fecha_pago = date.today()
+        cuota.save(update_fields=['fecha_pago'])
+        cuota.actualizar_estado()
 
     return redirect('dashboard-administrativo')
 
-def rechazar_pago(request, id_pago):
 
-    pago = PagoPendiente.objects.get(
-        id_pago=id_pago
+def ver_comprobante_pago(request, id_comprobante):
+    if not _admin_session(request):
+        return redirect('login')
+    comprobante = get_object_or_404(ComprobantePago, id_comprobante=id_comprobante)
+    if not comprobante.archivo:
+        raise Http404('El comprobante no tiene archivo.')
+    try:
+        archivo = comprobante.archivo.open('rb')
+    except FileNotFoundError as exc:
+        raise Http404('El archivo del comprobante no está disponible.') from exc
+    return FileResponse(
+        archivo,
+        as_attachment=False,
+        filename=comprobante.archivo.name.rsplit('/', 1)[-1],
     )
 
-    pago.delete()
+@require_POST
+def rechazar_pago(request, id_pago):
+    if not _admin_session(request):
+        return redirect('login')
+
+    motivo = (request.POST.get('motivo_rechazo') or '').strip()
+    if not motivo:
+        messages.error(request, 'Debe indicar el motivo del rechazo.')
+        return redirect('dashboard-administrativo')
+
+    with transaction.atomic():
+        pago = PagoPendiente.objects.select_for_update().get(id_pago=id_pago)
+        if pago.estado == 'Pagado':
+            messages.error(request, 'No se puede rechazar un pago ya pagado.')
+            return redirect('dashboard-administrativo')
+
+        try:
+            pago_aplicado = pago.pago_aplicado
+        except PagoCuota.DoesNotExist:
+            pago_aplicado = None
+        if pago_aplicado:
+            pago_aplicado.estado = 'Rechazado'
+            pago_aplicado.save(update_fields=['estado'])
+            ComprobantePago.objects.filter(pago=pago_aplicado).update(estado='Rechazado')
+        pago.estado = 'Rechazado'
+        pago.motivo_rechazo = motivo
+        pago.save(update_fields=['estado', 'motivo_rechazo'])
 
     return redirect(
         'dashboard-administrativo'
     )
 
 @never_cache
+@require_POST
 def enviar_documentacion(request):
 
     if request.method != 'POST':
@@ -4584,8 +5007,12 @@ def enviar_documentacion(request):
 
     try:
 
+        tutor = _tutor_session(request)
+        if not tutor:
+            return redirect('login')
         alumno = Alumno.objects.get(
-            legajo=request.POST.get('alumno')
+            legajo=request.POST.get('alumno'),
+            tutortutoraalumno__id_tutor=tutor,
         )
 
         doc_existente = DocumentacionAlumno.objects.filter(
@@ -4607,7 +5034,7 @@ def enviar_documentacion(request):
             doc_existente.delete()
 
         fs = FileSystemStorage(
-            location='media/documentacion'
+            location=os.path.join(settings.PRIVATE_DOCUMENT_ROOT, 'documentacion')
         )
 
         dni_frente = request.FILES.get('dni_frente')
@@ -4713,11 +5140,16 @@ def enviar_documentacion(request):
             extra_tags="documentacion"
         )
 
-    except Exception as e:
-
+    except Alumno.DoesNotExist:
         messages.error(
             request,
-            f'Error al enviar la documentación: {e}',
+            'No se pudo validar el alumno asociado a esta cuenta.',
+            extra_tags="documentacion",
+        )
+    except Exception:
+        messages.error(
+            request,
+            'Ocurrió un error al enviar la documentación.',
             extra_tags="documentacion"
         )
 
@@ -4726,17 +5158,19 @@ def enviar_documentacion(request):
     return redirect('dashboard-padres')
 
 @never_cache
+@require_POST
 def aprobar_documentacion(request, id_documentacion):
+    administrativo = _admin_session(request)
+    if not administrativo:
+        return redirect('login')
 
     doc = get_object_or_404(
         DocumentacionAlumno,
         id_documentacion=id_documentacion
     )
 
-    persona = obtener_persona(request)
-
     administrativo = PersonalAdministrativo.objects.filter(
-        id_persona=persona
+        id_persona=administrativo
     ).first()
 
     doc.estado = "Aprobada"
@@ -4749,13 +5183,60 @@ def aprobar_documentacion(request, id_documentacion):
     return redirect('dashboard-administrativo')
 
 
+@never_cache
+def ver_documentacion(request, id_documentacion, tipo):
+    """Entrega documentación privada solo a administración o al tutor asociado."""
+    doc = get_object_or_404(
+        DocumentacionAlumno.objects.select_related('legajo_alumno'),
+        id_documentacion=id_documentacion,
+    )
+    campos = {
+        'dni_frente': doc.dni_frente,
+        'dni_dorso': doc.dni_dorso,
+        'partida_nacimiento': doc.partida_nacimiento,
+        'certificado_salud': doc.certificado_salud,
+    }
+    archivo_relativo = campos.get(tipo)
+    if not archivo_relativo:
+        raise Http404
+
+    autorizado = bool(_admin_session(request))
+    if not autorizado:
+        tutor = _tutor_session(request)
+        autorizado = bool(tutor and TutorTutoraAlumno.objects.filter(
+            id_tutor=tutor,
+            id_alumno=doc.legajo_alumno,
+        ).exists())
+    if not autorizado:
+        raise Http404
+
+    raiz_privada = settings.PRIVATE_DOCUMENT_ROOT
+    ruta = (raiz_privada / archivo_relativo).resolve()
+    try:
+        ruta.relative_to(raiz_privada)
+    except ValueError:
+        raise Http404
+    if not ruta.is_file():
+        raise Http404
+
+    import mimetypes
+    return FileResponse(
+        ruta.open('rb'),
+        as_attachment=True,
+        filename=ruta.name,
+        content_type=mimetypes.guess_type(ruta.name)[0] or 'application/octet-stream',
+    )
+
+
+@require_POST
 def rechazar_documentacion(request, id_documentacion):
+    persona = _admin_session(request)
+    if not persona:
+        return redirect('login')
 
     doc = DocumentacionAlumno.objects.get(
         id_documentacion=id_documentacion
     )
-
-    persona = obtener_persona(request)
 
     administrativo = PersonalAdministrativo.objects.filter(
         id_persona=persona
@@ -4784,7 +5265,7 @@ def rechazar_documentacion(request, id_documentacion):
         if archivo:
 
             ruta = os.path.join(
-                settings.MEDIA_ROOT,
+                settings.PRIVATE_DOCUMENT_ROOT,
                 archivo
             )
 
@@ -4924,6 +5405,7 @@ def editar_tarea(request, tarea_id):
         
     return redirect('/docente/?panel=tareas')
 @never_cache
+@require_POST
 def borrar_tarea(request, tarea_id):
     persona = obtener_persona(request)
     if not persona:
@@ -5096,7 +5578,13 @@ def guardar_nota(request):
 
 
 @never_cache
+@require_POST
 def guardar_observacion_justificacion(request):
+
+    persona = obtener_persona(request)
+    preceptor = Preceptor.objects.filter(id_persona=persona).first() if persona else None
+    if not preceptor:
+        return redirect('login')
 
     if request.method == 'POST':
 
@@ -5104,7 +5592,8 @@ def guardar_observacion_justificacion(request):
         observacion = request.POST.get('observacion', '').strip()
 
         asistencia = Asistencia.objects.filter(
-            id_asistencia=id_asistencia
+            id_asistencia=id_asistencia,
+            legajo_alumno__id_curso__legajo_preceptor=preceptor,
         ).first()
 
         if asistencia:
@@ -5135,10 +5624,11 @@ def lista_alumnos_admin(request):
         opiniones = []
     
     cuotas = Cuota.objects.select_related('id_tutor__id_persona', 'id_legajo_alumno__id_persona')
-    cuotas_pendientes = PagoPendiente.objects.exclude(estado='Pagada').count()
+    cuotas_abiertas = _obtener_cuotas_con_saldo()
+    cuotas_pendientes = len(cuotas_abiertas)
     solicitudes = SolicitudInscripcion.objects.all().order_by('-fecha_solicitud')
     inscripciones_pendientes = SolicitudInscripcion.objects.filter(estado="Pendiente").count()
-    pagos_pendientes = PagoPendiente.objects.all()
+    pagos_pendientes = _pagos_admin(request)
     documentacion_pendiente = DocumentacionAlumno.objects.filter(estado='Pendiente').count()
     documentaciones = DocumentacionAlumno.objects.filter(estado='Pendiente').order_by('-fecha_envio')
     
@@ -5156,6 +5646,8 @@ def lista_alumnos_admin(request):
         'persona': persona, 'administrativo': administrativo, 'instalaciones': instalaciones,
         'reservas': reservas, 'opiniones': opiniones, 'cuotas': cuotas,
         'cuotas_pendientes': cuotas_pendientes, 'solicitudes': solicitudes,
+        'cuotas_abiertas': cuotas_abiertas,
+        'periodo_cuota_sugerido': timezone.localdate().strftime('%Y-%m'),
         'inscripciones_pendientes': inscripciones_pendientes, 'pagos_pendientes': pagos_pendientes,
         'documentaciones': documentaciones, 'documentacion_pendiente': documentacion_pendiente,
         'panel_activo': 'alumnos', 'alumnos': alumnos, 'alumno_detalle': alumno_detalle,
@@ -5163,7 +5655,10 @@ def lista_alumnos_admin(request):
     })
 
 @never_cache
+@require_POST
 def alta_alumno_admin(request):
+    if not _admin_session(request):
+        return redirect('login')
     if request.method == 'POST':
         nombre_usuario = request.POST.get('nombre_usuario')
         contrasenia = request.POST.get('contrasenia')
@@ -5286,7 +5781,10 @@ def alta_alumno_admin(request):
     return redirect('lista-alumnos-admin')
 
 @never_cache
+@require_POST
 def modificar_alumno_admin(request, legajo):
+    if not _admin_session(request):
+        return redirect('login')
     alumno = get_object_or_404(Alumno, legajo=legajo)
     persona = alumno.id_persona
 
@@ -5368,7 +5866,10 @@ def modificar_alumno_admin(request, legajo):
     return redirect('lista-alumnos-admin')
 
 @never_cache
+@require_POST
 def baja_alumno_admin(request, legajo):
+    if not _admin_session(request):
+        return redirect('login')
     if request.method == 'POST':
         alumno = get_object_or_404(Alumno, legajo=legajo)
 

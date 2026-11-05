@@ -10,6 +10,7 @@ For the full list of settings and their values, see
 https://docs.djangoproject.com/en/6.0/ref/settings/
 """
 
+from datetime import timedelta
 from pathlib import Path
 import os
 
@@ -62,7 +63,10 @@ INSTALLED_APPS = [
     'django.contrib.sessions',
     'django.contrib.messages',
     'django.contrib.staticfiles',
+    'rest_framework',
+    'rest_framework_simplejwt',
     'core',
+    'mobile_api',
 ]
 
 MIDDLEWARE = [
@@ -154,6 +158,12 @@ STATIC_ROOT = BASE_DIR / 'staticfiles'
 # Media files
 MEDIA_URL = '/media/'
 MEDIA_ROOT = BASE_DIR / 'media'
+# La documentación de los alumnos contiene información personal y no debe
+# publicarse mediante el servidor estático de archivos multimedia.
+PRIVATE_DOCUMENT_ROOT = Path(os.getenv(
+    'PRIVATE_DOCUMENT_ROOT',
+    str(BASE_DIR.parent / 'private_documents'),
+)).resolve()
 
 
 EMAIL_BACKEND = os.getenv(
@@ -171,3 +181,20 @@ STATICFILES_STORAGE = "whitenoise.storage.CompressedManifestStaticFilesStorage"
 CSRF_TRUSTED_ORIGINS = [origin.strip() for origin in os.getenv(
     "CSRF_TRUSTED_ORIGINS", "https://educar-production.up.railway.app"
 ).split(",") if origin.strip()]
+
+
+
+REST_FRAMEWORK = {
+    "DEFAULT_THROTTLE_RATES": {
+        "mobile_login": "10/hour",
+    },
+}
+
+SIMPLE_JWT = {
+    "ACCESS_TOKEN_LIFETIME": timedelta(hours=8),
+    "ISSUER": "educar-mobile",
+    "ALGORITHM": "HS256",
+    "SIGNING_KEY": SECRET_KEY,
+    "USER_ID_FIELD": "id",
+    "USER_ID_CLAIM": "user_id",
+}
